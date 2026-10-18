@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache
+.pytest_cache/
+.pytest_tmp/
+.agent-state/
+artifacts/
+
+# IDE
+.vscode/
+.idea/
+
+# Sensitive / non-repo docs
+temp_docs/
+
+# OS
+Thumbs.db
+.DS_Store
