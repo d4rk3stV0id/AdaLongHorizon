@@ -32,7 +32,13 @@ class Orchestrator:
         state_dir = Path(config.workspace) / config.state_dir
         self.store = StateStore(state_dir)
         self.events = EventLogger(state_dir / "events.jsonl")
-        self.provider = provider or DeterministicProvider()
+        if provider is not None:
+            self.provider = provider
+        elif config.provider == "ollama":
+            from .llm.ollama import OllamaProvider
+            self.provider = OllamaProvider(host=config.ollama_host, model=config.llm_model)
+        else:
+            self.provider = DeterministicProvider()
         self.planner = Planner()
 
     def run(

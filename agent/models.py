@@ -311,3 +311,5 @@ class AgentConfig:
     max_snapshot_files: int = 500
     command_timeout_seconds: float = 30.0
     provider: str = "deterministic"
+    ollama_host: str = "http://localhost:11434"
+    llm_model: str = "qwen3:8b"
