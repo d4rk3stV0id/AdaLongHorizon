@@ -179,6 +179,28 @@ def test_budget_unknown_kind():
         ledger.check("magic")
 
 
+def test_budget_actual_usage_replaces_estimate_without_double_counting():
+    ledger = BudgetLedger(max_token_estimate=30)
+    ledger.record("tokens", 10)
+    ledger.record_actual_usage(12, 18, replace_estimated=10)
+    assert ledger.estimated_tokens == 0
+    assert ledger.actual_input_tokens == 12
+    assert ledger.actual_output_tokens == 18
+    assert ledger.actual_tokens == 30
+    ledger.check("tokens", 0)
+    with pytest.raises(BudgetExceeded, match="tokens budget exhausted"):
+        ledger.check("tokens", 1)
+
+
+def test_actual_usage_over_budget_is_recorded_before_budget_error():
+    ledger = BudgetLedger(max_token_estimate=20)
+    ledger.record("tokens", 10)
+    with pytest.raises(BudgetExceeded, match="tokens budget exhausted"):
+        ledger.record_actual_usage(11, 10, replace_estimated=10)
+    assert ledger.estimated_tokens == 0
+    assert ledger.actual_tokens == 21
+
+
 def test_plan_structural_validation():
     # Valid plan
     step1 = PlanStep(step_id="step1", objective="Do step 1")
@@ -211,3 +233,19 @@ def test_plan_structural_validation():
         steps=[PlanStep("s1", "objective", dependencies=["nonexistent"])],
     )
     assert any("depends on unknown step" in e for e in bad_dep_plan.validate())
+
+
+def test_plan_accepts_executor_supported_edit_file_action():
+    plan = Plan("issue-1", [PlanStep(
+        "edit", "Make a localized change", expected_files=["src/app.py"], action_type="edit_file",
+    )])
+
+    assert plan.validate() == []
+
+
+def test_plan_rejects_action_not_supported_by_executor():
+    plan = Plan("issue-1", [PlanStep(
+        "delete", "Delete a file", expected_files=["src/app.py"], action_type="delete_file",
+    )])
+
+    assert any("unsupported action_type 'delete_file'" in error for error in plan.validate())
