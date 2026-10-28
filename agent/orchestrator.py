@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 from .errors import BudgetExceeded
 from .executor import Executor
@@ -21,8 +22,8 @@ from .models import (
 from .planner import Planner
 from .state.store import StateStore
 from .state.progress import (
-    PersistentTaskState, ProgressStatus, create_progress_state,
-    update_from_verification,
+    PersistentTaskState, ProgressStatus, RoundTrace, RunTrace,
+    create_progress_state, summarize_provider_usage, update_from_verification,
 )
 from .verifier import Verifier
 from .telemetry.logger import EventLogger
@@ -47,9 +48,13 @@ class Orchestrator:
             self.provider = DeterministicProvider()
         self.planner = Planner(self.provider if config.provider == "ollama" else None)
         self.verifier = Verifier()
+        self.last_run_trace: RunTrace | None = None
 
     def run(
         self, issue: IssueSpec, budget: BudgetLedger | None = None,
+        persistent_state: PersistentTaskState | None = None,
+        requirement_checks: dict[str, list[str]] | None = None,
+        round_id: int = 1,
     ) -> tuple[TaskState, ObservationBundle]:
         state = TaskState(
             issue,
@@ -67,7 +72,9 @@ class Orchestrator:
 
             # --- PLANNING ---
             state.transition(Lifecycle.PLANNING)
-            state.plan = self.planner.create_plan(issue, snapshot, state, state.budget)
+            state.plan = self.planner.create_plan(
+                issue, snapshot, state, state.budget, persistent_state=persistent_state,
+            )
             self._save_event(state, "plan_created", {
                 "steps": [s.step_id for s in state.plan.steps],
                 "llm_usage": state.transient.get("last_llm_usage"),
@@ -95,6 +102,12 @@ class Orchestrator:
             obs.notes.append(f"Independent verification: {verification.status.value}.")
             if verification.failures:
                 obs.notes.extend(verification.failures)
+
+            if persistent_state is not None and requirement_checks is not None:
+                update_from_verification(
+                    persistent_state, verification, requirement_checks, test_result, round_id=round_id,
+                )
+                self.store.save_progress(persistent_state)
 
             all_steps_done = state.plan is not None and all(
                 step.status == StepStatus.COMPLETED for step in state.plan.steps
@@ -131,17 +144,44 @@ class Orchestrator:
         })
         return state, obs
 
+    def run_persistent_round(
+        self,
+        persistent_state: PersistentTaskState,
+        requirement_checks: dict[str, list[str]],
+        budget: BudgetLedger | None = None,
+    ) -> tuple[TaskState, ObservationBundle]:
+        """Execute exactly one fresh runtime round against durable verified state."""
+        issue = IssueSpec(
+            title=persistent_state.issue["title"],
+            description=persistent_state.issue["description"],
+            acceptance_criteria=list(persistent_state.issue["acceptance_criteria"]),
+            issue_id=persistent_state.issue["issue_id"],
+        )
+        return self.run(
+            issue, budget, persistent_state=persistent_state,
+            requirement_checks=requirement_checks,
+        )
+
     def run_persistent(
         self, issue: IssueSpec, budget: BudgetLedger | None = None,
     ) -> tuple[PersistentTaskState, list[tuple[TaskState, ObservationBundle]]]:
         """Run fresh bounded execution contexts against one durable task state."""
+        run_started = perf_counter()
+        self.last_run_trace = None
         shared_budget = budget or BudgetLedger(command_timeout_seconds=self.config.command_timeout_seconds)
-        task_id = __import__("uuid").uuid4().hex
+        task_id = uuid4().hex
+        run_id = uuid4().hex
         progress = create_progress_state(task_id, issue)
         self.store.save_progress(progress)
         rounds: list[tuple[TaskState, ObservationBundle]] = []
-        for round_id, requirement in enumerate(progress.requirements, 1):
+        max_rounds = len(progress.requirements)
+        for round_id in range(1, max_rounds + 1):
             if progress.status != ProgressStatus.IN_PROGRESS:
+                break
+            requirement = next(
+                (item for item in progress.requirements if item.status.value == "pending"), None,
+            )
+            if requirement is None:
                 break
             pending_issue = IssueSpec(
                 title=issue.title,
@@ -150,7 +190,19 @@ class Orchestrator:
                 issue_id=issue.issue_id,
             )
             started = perf_counter()
-            state, observations = self.run(pending_issue, shared_budget)
+            previously_completed = {
+                item.requirement_id for item in progress.requirements
+                if item.status.value == "completed"
+            }
+            pending_before = sum(item.status.value == "pending" for item in progress.requirements)
+            pending_ids_before = [
+                item.requirement_id for item in progress.requirements
+                if item.status.value == "pending"
+            ]
+            tools_before = shared_budget.tool_actions
+            state, observations = self.run(
+                pending_issue, shared_budget, persistent_state=progress, round_id=round_id,
+            )
             rounds.append((state, observations))
             raw = state.transient.get("verification_result", {})
             verification = self.verifier.verify(
@@ -172,31 +224,54 @@ class Orchestrator:
                     progress, verification, {requirement.requirement_id: mapped_checks},
                     test_result, round_id,
                 )
+            newly_verified = sum(
+                item.status.value == "completed" and item.requirement_id not in previously_completed
+                for item in progress.requirements
+            )
             trace = progress.rounds[-1] if progress.rounds and progress.rounds[-1].round_id == round_id else None
             if trace is None:
-                from .state.progress import RoundTrace
                 trace = RoundTrace(task_id, round_id)
                 progress.rounds.append(trace)
             usage = state.transient.get("llm_usage", [])
-            trace.llm_calls = len(usage)
-            trace.input_tokens = sum(item["input_tokens"] for item in usage if "input_tokens" in item) if usage and all("input_tokens" in item for item in usage) else None
-            trace.output_tokens = sum(item["output_tokens"] for item in usage if "output_tokens" in item) if usage and all("output_tokens" in item for item in usage) else None
-            trace.total_tokens = (trace.input_tokens + trace.output_tokens) if trace.input_tokens is not None and trace.output_tokens is not None else None
-            trace.tool_calls = len(observations.execution_records) + (1 if test_result else 0)
-            trace.planning_calls = 1
-            trace.verification_calls = 1
+            provider_usage = summarize_provider_usage(
+                usage, llm_provider_enabled=self.config.provider == "ollama",
+            )
+            trace.llm_calls = provider_usage.llm_calls
+            trace.input_tokens = provider_usage.input_tokens
+            trace.output_tokens = provider_usage.output_tokens
+            trace.total_tokens = provider_usage.total_tokens
+            trace.provider_latency_ms = provider_usage.provider_latency_ms
+            trace.tool_calls = shared_budget.tool_actions - tools_before
+            trace.planning_calls = sum(
+                item.get("purpose") == "planning" for item in usage
+            ) if self.config.provider == "ollama" else 0
+            trace.verification_calls = 1 + int("verification_result" in state.transient)
             trace.execution_time_seconds = perf_counter() - started
-            trace.verification_result = raw.get("status")
-            trace.final_outcome = "completed" if requirement.status.value == "completed" else "blocked"
-            if requirement.status.value != "completed":
+            trace.planning_result = "accepted" if state.plan is not None else "failed"
+            trace.verification_result = verification.status.value
+            trace.pending_requirements = pending_before
+            trace.pending_requirement_ids = pending_ids_before
+            trace.newly_verified_requirements = newly_verified
+            trace.final_outcome = state.status.value.lower()
+            if requirement.status.value != "completed" or newly_verified == 0:
                 progress.status = ProgressStatus.BLOCKED
             for record in observations.execution_records:
                 if record.tool_result.success and record.action.get("path"):
                     if record.action["path"] not in progress.artifacts:
                         progress.artifacts.append(record.action["path"])
             self.store.save_progress(progress)
+            # The next round deliberately reconstructs its durable input from disk.
+            progress = self.store.load_progress(task_id)
             if progress.status == ProgressStatus.BLOCKED:
                 break
+        self.last_run_trace = RunTrace.from_rounds(
+            task_id=task_id,
+            rounds=progress.rounds,
+            final_outcome=progress.status.value,
+            elapsed_seconds=perf_counter() - run_started,
+            verification_result=(progress.rounds[-1].verification_result if progress.rounds else None),
+            run_id=run_id,
+        )
         return progress, rounds
 
     def _save_event(self, state: TaskState, event_type: str, payload=None):

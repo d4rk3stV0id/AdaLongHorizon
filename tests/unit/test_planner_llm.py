@@ -6,6 +6,7 @@ from agent.errors import LLMConnectionError
 from agent.llm.base import LLMResponse
 from agent.models import BudgetLedger, IssueSpec, Plan, PlanStep, RepositorySnapshot, TaskState
 from agent.planner import PlanValidationError, Planner, plan_response_schema
+from agent.state.progress import RequirementStatus, create_progress_state
 
 
 def _step(step_id="implementation", objective="Implement the requested change", dependencies=None):
@@ -156,6 +157,23 @@ def test_deterministic_planner_baseline_remains_available():
     plan = Planner().create_plan(issue, snapshot, state)
     assert [step.step_id for step in plan.steps] == ["implementation", "test"]
     assert plan.validate() == []
+
+
+def test_planner_receives_only_pending_requirements_and_verified_state_context():
+    issue, snapshot, state = _inputs()
+    issue.acceptance_criteria.append("already complete")
+    progress = create_progress_state("task-1", issue)
+    progress.requirements[1].status = RequirementStatus.COMPLETED
+    progress.facts.append("R2: already verified")
+    progress.artifacts.append("src/existing.py")
+
+    Planner().create_plan(issue, snapshot, state, persistent_state=progress)
+
+    assert state.transient["persistent_context"] == {
+        "pending_requirements": [{"requirement_id": "R1", "description": "returns the product"}],
+        "verified_facts": ["R2: already verified"],
+        "artifacts": ["src/existing.py"],
+    }
 
 
 def test_schema_adapter_tracks_plan_step_domain_fields():

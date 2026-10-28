@@ -12,6 +12,7 @@ from .models import (
     BudgetLedger, IssueSpec, PLAN_ACTION_TYPES, Plan, PlanStep, RepositorySnapshot,
     StepStatus, TaskState,
 )
+from .state.progress import PersistentTaskState, RequirementStatus
 
 
 class PlanValidationError(ValueError):
@@ -85,7 +86,18 @@ class Planner:
         snapshot: RepositorySnapshot,
         state: TaskState,
         budget: BudgetLedger | None = None,
+        persistent_state: PersistentTaskState | None = None,
     ) -> Plan:
+        if persistent_state is not None:
+            state.transient["persistent_context"] = {
+                "pending_requirements": [
+                    {"requirement_id": item.requirement_id, "description": item.description}
+                    for item in persistent_state.requirements
+                    if item.status == RequirementStatus.PENDING
+                ],
+                "verified_facts": list(persistent_state.facts),
+                "artifacts": list(persistent_state.artifacts),
+            }
         if self.provider is None:
             return self.create_deterministic_plan(issue, snapshot, state, budget)
         return self._create_provider_plan(issue, snapshot, state, budget or state.budget)

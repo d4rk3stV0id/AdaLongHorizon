@@ -11,9 +11,11 @@ Python 3.11+ and Git. The demonstration uses pytest in a disposable temporary re
 ```powershell
 py -m pip install -e ".[dev]"
 py -m agent demo
+py -m agent multi-round-demo
 py -m agent llm-smoke-test
 py -m agent executor-ollama-smoke
 py -m agent ollama-demo
+py -m agent ollama-multi-round-demo
 py -m pytest
 ```
 
@@ -27,6 +29,10 @@ structured response and Ollama-reported usage. Configure it with
 `ADA_AGENT_PROVIDER=ollama` to select the Ollama-backed Planner and Executor
 through the Orchestrator. `ollama-demo` is the explicit disposable end-to-end
 path and uses `ADA_OLLAMA_HOST` and `ADA_LLM_MODEL` for its local model.
+`ollama-multi-round-demo` uses the same local provider in a disposable
+repository, but runs two independent requirements through persistent multi-round
+orchestration and reports the measured run trace. It requires the configured
+Ollama service and model to be available.
 
 `executor-ollama-smoke` runs one model-generated action through the existing
 Executor in a disposable workspace, then runs its small pytest fixture there.
@@ -47,6 +53,16 @@ The demo creates a tiny Python repository, inspects it, plans two file changes,
 executes validated write actions, runs its discovered test command, and prints
 structured observations. It does not modify this checkout.
 
+`multi-round-demo` builds a separate temporary repository and runs two
+independent requirements through the persistent-state orchestration. It prints
+the pending requirements and newly verified count for each round, the final
+state, trace summary, and temporary repository diff. The deterministic provider
+makes no LLM calls, so token and provider-latency fields are reported as
+unavailable. To reproduce the run, use the command above with the built-in
+deterministic provider and the discovered `python -m pytest -q` command. For
+provider-backed runs, `Orchestrator.last_run_trace` contains measured usage when
+the provider reports it; unavailable token fields remain `None`.
+
 For Ollama action generation, the Executor includes only existing files named
 by the current step's `expected_files`, capped at 8,000 characters total.
 Localized changes use `edit_file`, which atomically replaces one or more exact,
@@ -58,6 +74,7 @@ The Orchestrator records each validated mutation separately from its execution
 result, then runs a deterministic read-only verifier over the actual target file
 contents and test-command result. `COMPLETED` now requires both completed plan
 steps and a verified result. A rejected result leaves the round `BLOCKED`; the
-verifier does not retry or modify repository state. Persistent cross-round state,
-recovery, adaptive budgets, and benchmark infrastructure remain outside this
-phase.
+verifier does not retry or modify repository state. Persistent cross-round state
+is available through the bounded orchestration and is demonstrated by
+`multi-round-demo`. Recovery, adaptive budgets, and benchmark infrastructure
+remain outside this phase.

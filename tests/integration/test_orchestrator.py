@@ -16,6 +16,7 @@ from agent.models import (
     StepStatus,
 )
 from agent.orchestrator import Orchestrator
+from agent.state.progress import RequirementStatus, create_progress_state
 
 
 class FailureMockProvider(LLMProvider):
@@ -128,6 +129,185 @@ def test_orchestrator_test_failure_transitions_to_blocked(git_repo: Path):
     assert state.status == Lifecycle.BLOCKED
     assert state.budget.consecutive_failures == 1
     assert state.transient["verification_result"]["status"] == "rejected"
+
+
+def test_single_persistent_round_updates_and_persists_verified_requirement(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), DeterministicProvider())
+    issue = IssueSpec("Add normalize_whitespace", "Add a function to normalize whitespace in strings and tests", ["function exists", "pytest passes"])
+    progress = create_progress_state("durable-task", issue)
+
+    runtime, _ = orchestrator.run_persistent_round(
+        progress,
+        {"R1": ["execution_record_0_repository_state"], "R2": ["execution_record_1_repository_state"]},
+    )
+
+    assert runtime.status == Lifecycle.COMPLETED
+    assert [item.status for item in progress.requirements] == [RequirementStatus.COMPLETED, RequirementStatus.COMPLETED]
+    assert orchestrator.store.load_progress("durable-task") == progress
+
+
+def test_single_persistent_round_rejected_verification_cannot_complete(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), DeterministicProvider())
+    progress = create_progress_state("durable-task", IssueSpec("Add function", "Add a function and tests", ["function exists"]))
+    original_write = orchestrator.repository.write_file
+
+    def corrupt_write(path, content):
+        result = original_write(path, content)
+        (git_repo / path).write_text("corrupted = True\n", encoding="utf-8")
+        return result
+
+    with mock.patch.object(orchestrator.repository, "write_file", side_effect=corrupt_write):
+        runtime, _ = orchestrator.run_persistent_round(
+            progress, {"R1": ["execution_record_0_repository_state"]},
+        )
+
+    assert runtime.status == Lifecycle.BLOCKED
+    assert progress.requirements[0].status == RequirementStatus.PENDING
+    assert orchestrator.store.load_progress("durable-task").requirements[0].status == RequirementStatus.PENDING
+
+
+def test_single_persistent_round_failed_tests_cannot_complete(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), FailureMockProvider())
+    progress = create_progress_state("durable-task", IssueSpec("Add function", "Add a function and tests", ["function exists"]))
+
+    runtime, _ = orchestrator.run_persistent_round(
+        progress, {"R1": ["execution_record_0_repository_state"]},
+    )
+
+    assert runtime.status == Lifecycle.BLOCKED
+    assert progress.requirements[0].status == RequirementStatus.PENDING
+    assert orchestrator.store.load_progress("durable-task").requirements[0].status == RequirementStatus.PENDING
+
+
+def test_persistent_run_reloads_verified_state_between_two_fresh_rounds(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), DeterministicProvider())
+    issue = IssueSpec("Add normalize_whitespace", "Add a function to normalize whitespace in strings and tests", ["function exists", "pytest passes"])
+
+    progress, rounds = orchestrator.run_persistent(issue)
+
+    assert len(rounds) == 2
+    assert all(state is not other_state for state, _ in rounds for other_state, _ in rounds if state is not other_state)
+    assert [item.status for item in progress.requirements] == [RequirementStatus.COMPLETED, RequirementStatus.COMPLETED]
+    assert progress.status.value == "completed"
+
+
+def test_persistent_run_stops_after_a_rejected_first_round(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), FailureMockProvider())
+    issue = IssueSpec("Add function", "Add a function and tests", ["R1", "R2"])
+
+    progress, rounds = orchestrator.run_persistent(issue)
+
+    assert len(rounds) == 1
+    assert [item.status for item in progress.requirements] == [RequirementStatus.PENDING, RequirementStatus.PENDING]
+    assert progress.status.value == "blocked"
+
+
+def test_multi_round_run_exposes_one_trace_per_round_and_run_summary(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), DeterministicProvider())
+    issue = IssueSpec("Add normalize_whitespace", "Add a function to normalize whitespace in strings and tests", ["function exists", "pytest passes"])
+
+    progress, _ = orchestrator.run_persistent(issue)
+    trace = orchestrator.last_run_trace
+
+    assert trace is not None
+    assert trace.task_id == progress.task_id
+    assert trace.rounds_attempted == 2
+    assert trace.final_outcome == "completed"
+    assert trace.llm_calls == 0
+    assert trace.tool_actions == sum(round_trace.tool_calls for round_trace in trace.rounds)
+    assert trace.input_tokens is None
+    assert trace.output_tokens is None
+    assert trace.total_tokens is None
+    assert [item.newly_verified_requirements for item in trace.rounds] == [1, 1]
+    assert [item.pending_requirements for item in trace.rounds] == [2, 1]
+    assert [item.pending_requirement_ids for item in trace.rounds] == [["R1", "R2"], ["R2"]]
+    assert [item.verification_result for item in trace.rounds] == ["verified", "verified"]
+    assert trace.provider_latency_ms is None
+    assert len(progress.rounds) == trace.rounds_attempted
+
+
+def test_provider_usage_is_aggregated_from_measured_multi_round_calls(git_repo: Path):
+    from agent.llm.base import LLMResponse
+
+    (git_repo / "src").mkdir()
+    (git_repo / "tests").mkdir()
+    (git_repo / "tests" / "test_smoke.py").write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    (git_repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\npythonpath = ['.']\n",
+        encoding="utf-8",
+    )
+
+    class MeasuredTwoRoundProvider:
+        def __init__(self):
+            self.plan_contexts = []
+            self.plan_count = 0
+
+        def propose_plan(self, issue, snapshot, state, budget, response_schema):
+            self.plan_contexts.append(state.transient["persistent_context"])
+            self.plan_count += 1
+            requirement_id = "R1" if "Current round requirement (R1)" in issue.description else "R2"
+            path = f"src/{requirement_id.lower()}.py"
+            return LLMResponse(
+                content={"steps": [{
+                    "step_id": "implementation", "objective": f"Implement {requirement_id}",
+                    "dependencies": [], "expected_files": [path], "action_type": "write_file",
+                    "acceptance_checks": [f"{requirement_id} exists"], "risk_level": "low",
+                    "estimated_cost": 1,
+                }]},
+                prompt_tokens=10 * self.plan_count, output_tokens=3, total_tokens=10 * self.plan_count + 3,
+                duration_ms=100.0 + self.plan_count, provider="test-provider", model="test-model",
+                usage_available=True,
+            )
+
+        def propose_action(self, issue, step, snapshot, state):
+            path = step.expected_files[0]
+            return LLMResponse(
+                content={"type": "write_file", "path": path, "content": f"value = {path!r}\n"},
+                prompt_tokens=5, output_tokens=2, total_tokens=7, duration_ms=50.0,
+                provider="test-provider", model="test-model", usage_available=True,
+            )
+
+    provider = MeasuredTwoRoundProvider()
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo), provider="ollama"), provider)
+    original_load = orchestrator.store.load_progress
+    loaded_snapshots = []
+
+    def recording_load(task_id):
+        loaded = original_load(task_id)
+        loaded_snapshots.append(loaded.to_dict())
+        return loaded
+
+    orchestrator.store.load_progress = recording_load
+    issue = IssueSpec("Write files", "Implement two independent files", ["A exists", "B exists"])
+
+    progress, _ = orchestrator.run_persistent(issue)
+    trace = orchestrator.last_run_trace
+
+    assert progress.status.value == "completed"
+    assert trace is not None
+    assert trace.llm_calls == 4
+    assert trace.input_tokens == 40
+    assert trace.output_tokens == 10
+    assert trace.total_tokens == 50
+    assert trace.provider_latency_ms == 303.0
+    assert [item.llm_calls for item in trace.rounds] == [2, 2]
+    assert [item.input_tokens for item in trace.rounds] == [15, 25]
+    assert [item.output_tokens for item in trace.rounds] == [5, 5]
+    assert [item.provider_latency_ms for item in trace.rounds] == [151.0, 152.0]
+    assert trace.tool_actions == 4
+    assert provider.plan_contexts[1]["pending_requirements"] == [
+        {"requirement_id": "R2", "description": "B exists"},
+    ]
+    assert len(loaded_snapshots) == 2
+    assert [item["status"] for item in loaded_snapshots[0]["requirements"]] == [
+        "completed", "pending",
+    ]
 
 
 def test_orchestrator_multiply_task_completed(git_repo: Path):

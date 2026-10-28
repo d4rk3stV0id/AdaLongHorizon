@@ -12,10 +12,14 @@ from ..verifier import VerificationResult
 
 _ISSUE_FIELDS = {"title", "description", "acceptance_criteria", "issue_id"}
 _REQUIREMENT_FIELDS = {"requirement_id", "description", "status"}
-_ROUND_TRACE_FIELDS = {
+_ROUND_TRACE_REQUIRED_FIELDS = {
     "task_id", "round_id", "llm_calls", "input_tokens", "output_tokens",
     "total_tokens", "tool_calls", "planning_calls", "verification_calls",
     "execution_time_seconds", "verification_result", "final_outcome",
+}
+_ROUND_TRACE_OPTIONAL_FIELDS = {
+    "provider_latency_ms", "planning_result", "pending_requirements",
+    "pending_requirement_ids", "newly_verified_requirements",
 }
 
 
@@ -40,6 +44,8 @@ class TaskRequirement:
 
 @dataclass
 class RoundTrace:
+    """Observed round metrics; token values are measured or unavailable (`None`)."""
+
     task_id: str
     round_id: int
     llm_calls: int | None = None
@@ -50,8 +56,113 @@ class RoundTrace:
     planning_calls: int | None = None
     verification_calls: int | None = None
     execution_time_seconds: float | None = None
+    provider_latency_ms: float | None = None
+    planning_result: str | None = None
     verification_result: str | None = None
+    pending_requirements: int | None = None
+    pending_requirement_ids: list[str] = field(default_factory=list)
+    newly_verified_requirements: int | None = None
     final_outcome: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderUsageSummary:
+    llm_calls: int
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    provider_latency_ms: float | None
+
+
+@dataclass
+class RunTrace:
+    """Run summary; optional measurements remain unavailable instead of estimated."""
+
+    task_id: str
+    rounds_attempted: int
+    final_outcome: str
+    run_id: str | None = None
+    elapsed_seconds: float | None = None
+    llm_calls: int | None = None
+    tool_actions: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    provider_latency_ms: float | None = None
+    verification_result: str | None = None
+    rounds: list[RoundTrace] = field(default_factory=list)
+
+    @classmethod
+    def from_rounds(
+        cls,
+        task_id: str,
+        rounds: list[RoundTrace],
+        final_outcome: str,
+        elapsed_seconds: float,
+        verification_result: str | None,
+        run_id: str | None = None,
+    ) -> "RunTrace":
+        """Aggregate measured round values without filling gaps with estimates."""
+        llm_calls = sum(item.llm_calls for item in rounds) if all(item.llm_calls is not None for item in rounds) else None
+        tool_actions = sum(item.tool_calls for item in rounds) if all(item.tool_calls is not None for item in rounds) else None
+        active_rounds = [item for item in rounds if item.llm_calls is not None and item.llm_calls > 0]
+
+        def measured_total(attribute: str) -> int | float | None:
+            if llm_calls is None or not active_rounds:
+                return None
+            values = [getattr(item, attribute) for item in active_rounds]
+            if any(value is None for value in values):
+                return None
+            return sum(values)
+
+        return cls(
+            task_id=task_id,
+            rounds_attempted=len(rounds),
+            final_outcome=final_outcome,
+            run_id=run_id,
+            elapsed_seconds=elapsed_seconds,
+            llm_calls=llm_calls,
+            tool_actions=tool_actions,
+            input_tokens=measured_total("input_tokens"),
+            output_tokens=measured_total("output_tokens"),
+            total_tokens=measured_total("total_tokens"),
+            provider_latency_ms=measured_total("provider_latency_ms"),
+            verification_result=verification_result,
+            rounds=list(rounds),
+        )
+
+
+def summarize_provider_usage(
+    usage_records: list[dict[str, Any]], *, llm_provider_enabled: bool,
+) -> ProviderUsageSummary:
+    """Summarize provider observations; estimated tokens never enter measured totals."""
+    calls = usage_records if llm_provider_enabled else []
+
+    def reported_total(
+        field_name: str, *, token_metric: bool = False,
+    ) -> int | float | None:
+        if not calls:
+            return None
+        if token_metric and any(record.get("usage_available") is not True for record in calls):
+            return None
+        values = [record.get(field_name) for record in calls]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (token_metric and not isinstance(value, int))
+            or value < 0
+            for value in values
+        ):
+            return None
+        return sum(values)
+
+    return ProviderUsageSummary(
+        llm_calls=len(calls),
+        input_tokens=reported_total("input_tokens", token_metric=True),
+        output_tokens=reported_total("output_tokens", token_metric=True),
+        total_tokens=reported_total("total_tokens", token_metric=True),
+        provider_latency_ms=reported_total("latency_ms"),
+    )
 
 
 @dataclass
@@ -195,8 +306,14 @@ def _requirement_from_dict(value: Any) -> TaskRequirement:
 
 
 def _round_trace_from_dict(value: Any) -> RoundTrace:
-    if not isinstance(value, dict) or set(value) != _ROUND_TRACE_FIELDS:
+    if (
+        not isinstance(value, dict)
+        or not _ROUND_TRACE_REQUIRED_FIELDS <= set(value)
+        or set(value) - (_ROUND_TRACE_REQUIRED_FIELDS | _ROUND_TRACE_OPTIONAL_FIELDS)
+    ):
         raise ValueError("malformed round trace")
+    defaults = asdict(RoundTrace(value["task_id"], value["round_id"]))
+    value = {**defaults, **value}
     if not isinstance(value["task_id"], str) or not value["task_id"].strip():
         raise ValueError("malformed round trace")
     if isinstance(value["round_id"], bool) or not isinstance(value["round_id"], int) or value["round_id"] < 1:
@@ -205,9 +322,18 @@ def _round_trace_from_dict(value: Any) -> RoundTrace:
         item = value[name]
         if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
             raise ValueError("malformed round trace")
-    duration = value["execution_time_seconds"]
-    if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0):
+    for name in ("execution_time_seconds", "provider_latency_ms"):
+        duration = value[name]
+        if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0):
+            raise ValueError("malformed round trace")
+    for name in ("pending_requirements", "newly_verified_requirements"):
+        count = value[name]
+        if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+            raise ValueError("malformed round trace")
+    if not isinstance(value["pending_requirement_ids"], list) or not all(
+        isinstance(item, str) and item.strip() for item in value["pending_requirement_ids"]
+    ):
         raise ValueError("malformed round trace")
-    if any(value[name] is not None and not isinstance(value[name], str) for name in ("verification_result", "final_outcome")):
+    if any(value[name] is not None and not isinstance(value[name], str) for name in ("planning_result", "verification_result", "final_outcome")):
         raise ValueError("malformed round trace")
     return RoundTrace(**value)
