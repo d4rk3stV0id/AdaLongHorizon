@@ -18,6 +18,131 @@ def test_file_operations_inside_workspace(git_repo: Path):
     assert content == "print('hello')\n"
 
 
+def test_edit_file_replaces_only_one_exact_occurrence(git_repo: Path):
+    target = git_repo / "src" / "utils.py"
+    target.parent.mkdir()
+    target.write_text('"""Small numeric utility functions."""\n\nvalue = 1\n', encoding="utf-8")
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("src/utils.py", [{
+        "old_text": "value = 1", "new_text": "def multiply(a, b):\n    return a * b",
+    }])
+
+    assert result.success
+    assert result.operation == "edit_file"
+    assert result.changed_files == ["src/utils.py"]
+    assert "Applied 1 exact edit" in result.stdout
+    assert target.read_text(encoding="utf-8") == (
+        '"""Small numeric utility functions."""\n\n'
+        "def multiply(a, b):\n    return a * b\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "old_text", "message"),
+    [
+        ("keep this\n", "missing", "not found"),
+        ("same\nsame\n", "same", "multiple times"),
+    ],
+)
+def test_edit_file_rejects_missing_or_ambiguous_text_without_modification(
+    git_repo: Path, content: str, old_text: str, message: str,
+):
+    target = git_repo / "src" / "utils.py"
+    target.parent.mkdir()
+    target.write_text(content, encoding="utf-8")
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("src/utils.py", [{"old_text": old_text, "new_text": "replacement"}])
+
+    assert not result.success
+    assert message in result.stderr
+    assert result.changed_files == []
+    assert target.read_text(encoding="utf-8") == content
+
+
+def test_edit_file_rejects_paths_outside_workspace(git_repo: Path):
+    repo = RepositoryAdapter(git_repo)
+
+    with pytest.raises(RepositoryError, match="must be relative"):
+        repo.edit_file("../outside.txt", [{"old_text": "old", "new_text": "new"}])
+
+
+def test_edit_file_requires_an_existing_target(git_repo: Path):
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("missing.txt", [{"old_text": "old", "new_text": "new"}])
+
+    assert not result.success
+    assert "does not exist" in result.stderr
+    assert not (git_repo / "missing.txt").exists()
+
+
+def test_edit_file_applies_multiple_non_overlapping_edits(git_repo: Path):
+    target = git_repo / "src" / "utils.py"
+    target.parent.mkdir()
+    original = '"""Small numeric utility functions."""\n\nvalue = 1\n\n# end\n'
+    target.write_text(original, encoding="utf-8")
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("src/utils.py", [
+        {"old_text": '"""Small numeric utility functions."""',
+         "new_text": '"""Small numeric utility functions."""\n\nfrom math import prod'},
+        {"old_text": "value = 1", "new_text": "def multiply(a, b):\n    return a * b"},
+    ])
+
+    assert result.success
+    assert target.read_text(encoding="utf-8") == (
+        '"""Small numeric utility functions."""\n\nfrom math import prod\n\n'
+        "def multiply(a, b):\n    return a * b\n\n# end\n"
+    )
+
+
+def test_edit_file_validates_all_edits_before_writing(git_repo: Path):
+    target = git_repo / "src" / "utils.py"
+    target.parent.mkdir()
+    original = "first = 1\nsecond = 2\n"
+    target.write_text(original, encoding="utf-8")
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("src/utils.py", [
+        {"old_text": "first = 1", "new_text": "first = 10"},
+        {"old_text": "missing = 3", "new_text": "missing = 30"},
+    ])
+
+    assert not result.success
+    assert "not found" in result.stderr
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_edit_file_rejects_overlapping_edits_without_modification(git_repo: Path):
+    target = git_repo / "src" / "utils.py"
+    target.parent.mkdir()
+    original = "abcdef\n"
+    target.write_text(original, encoding="utf-8")
+    repo = RepositoryAdapter(git_repo)
+
+    result = repo.edit_file("src/utils.py", [
+        {"old_text": "bcd", "new_text": "B"},
+        {"old_text": "def", "new_text": "D"},
+    ])
+
+    assert not result.success
+    assert "overlap" in result.stderr
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_write_file_still_creates_and_intentionally_replaces_files(git_repo: Path):
+    repo = RepositoryAdapter(git_repo)
+    repo.write_file("new.txt", "created\n")
+    assert (git_repo / "new.txt").read_text(encoding="utf-8") == "created\n"
+
+    result = repo.write_file("new.txt", "whole file replaced\n")
+
+    assert result.success
+    assert (git_repo / "new.txt").read_text(encoding="utf-8") == "whole file replaced\n"
+
+
 def test_file_operations_outside_workspace_rejected(git_repo: Path):
     repo = RepositoryAdapter(git_repo)
 

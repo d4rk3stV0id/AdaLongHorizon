@@ -122,3 +122,39 @@ def test_event_logger_append_and_read_all(tmp_path: Path):
         parsed = json.loads(line)
         assert "task_id" in parsed
         assert "event_type" in parsed
+
+
+def test_state_store_repeated_saves_replace_latest_state(tmp_path: Path):
+    state = TaskState(IssueSpec("first", "initial"))
+    store = StateStore(tmp_path / "state")
+    store.save(state)
+    state.issue.title = "updated"
+
+    store.save(state)
+
+    assert store.load(state.task_id).issue.title == "updated"
+
+
+def test_state_store_repeated_saves_remain_loadable(tmp_path: Path):
+    """Catch Windows replacement failures during ordinary serial persistence."""
+    state = TaskState(IssueSpec("stable", "serial persistence"))
+    store = StateStore(tmp_path / "state")
+
+    for index in range(1_000):
+        state.issue.title = f"save {index}"
+        store.save(state)
+
+    assert store.load(state.task_id).issue.title == "save 999"
+
+
+def test_state_stores_in_distinct_directories_do_not_share_task_state(tmp_path: Path):
+    first = TaskState(IssueSpec("first task", "first state"), task_id="same-task-id")
+    second = TaskState(IssueSpec("second task", "second state"), task_id="same-task-id")
+    first_store = StateStore(tmp_path / "first")
+    second_store = StateStore(tmp_path / "second")
+
+    first_store.save(first)
+    second_store.save(second)
+
+    assert first_store.load("same-task-id").issue.title == "first task"
+    assert second_store.load("same-task-id").issue.title == "second task"

@@ -51,6 +51,53 @@ class RepositoryAdapter:
         path.write_bytes(encoded)
         return ToolResult("write_file", True, changed_files=[path.relative_to(self.root).as_posix()])
 
+    def edit_file(self, relative: str, edits: list[dict[str, str]]) -> ToolResult:
+        """Atomically replace exact, unique, non-overlapping spans in one file."""
+        path = self._path(relative)
+        if not path.is_file():
+            return ToolResult("edit_file", False, stderr="target file does not exist")
+        if not isinstance(edits, list) or not edits:
+            return ToolResult("edit_file", False, stderr="edits must be a non-empty list")
+        if path.stat().st_size > self.max_file_bytes:
+            return ToolResult("edit_file", False, stderr="target file exceeds the read limit")
+
+        content = path.read_text(encoding="utf-8")
+        ranges: list[tuple[int, int, str]] = []
+        for index, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                return ToolResult("edit_file", False, stderr=f"edit {index} must be an object")
+            old_text = edit.get("old_text")
+            new_text = edit.get("new_text")
+            if not isinstance(old_text, str) or not old_text:
+                return ToolResult("edit_file", False, stderr=f"edit {index} old_text must be a non-empty string")
+            if not isinstance(new_text, str):
+                return ToolResult("edit_file", False, stderr=f"edit {index} new_text must be a string")
+            first = content.find(old_text)
+            if first < 0:
+                return ToolResult("edit_file", False, stderr=f"edit {index} old_text was not found in target file")
+            if content.find(old_text, first + 1) >= 0:
+                return ToolResult("edit_file", False, stderr=f"edit {index} old_text was found multiple times in target file")
+            ranges.append((first, first + len(old_text), new_text))
+
+        ordered_ranges = sorted(ranges, key=lambda item: item[0])
+        for previous, current in zip(ordered_ranges, ordered_ranges[1:]):
+            if current[0] < previous[1]:
+                return ToolResult("edit_file", False, stderr="requested edit ranges overlap")
+
+        updated = content
+        for start, end, new_text in sorted(ranges, key=lambda item: item[0], reverse=True):
+            updated = updated[:start] + new_text + updated[end:]
+        encoded = updated.encode("utf-8")
+        if len(encoded) > self.max_file_bytes:
+            return ToolResult("edit_file", False, stderr="edit exceeds file size limit")
+        path.write_bytes(encoded)
+        relative_path = path.relative_to(self.root).as_posix()
+        return ToolResult(
+            "edit_file", True,
+            stdout=f"Applied {len(edits)} exact edit(s) to {relative_path}",
+            changed_files=[relative_path],
+        )
+
     def run_command(self, args: list[str], timeout: float | None = None) -> ToolResult:
         before = set(self.changed_files())
         proc = self.runner.run(args, timeout)

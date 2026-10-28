@@ -1,0 +1,41 @@
+{
+  "artifacts": [],
+  "facts": [
+    "R1: matches"
+  ],
+  "issue": {
+    "acceptance_criteria": [
+      "X exists"
+    ],
+    "description": "Do X",
+    "issue_id": "66fa259b-a422-4403-9de7-e53143bbfde0",
+    "title": "Add X"
+  },
+  "requirements": [
+    {
+      "description": "X exists",
+      "requirement_id": "R1",
+      "status": "completed"
+    }
+  ],
+  "rounds": [
+    {
+      "execution_time_seconds": null,
+      "final_outcome": "completed",
+      "input_tokens": null,
+      "llm_calls": null,
+      "newly_verified_requirements": null,
+      "output_tokens": null,
+      "planning_calls": null,
+      "provider_latency_ms": null,
+      "round_id": 1,
+      "task_id": "task-1",
+      "tool_calls": null,
+      "total_tokens": null,
+      "verification_calls": null,
+      "verification_result": "verified"
+    }
+  ],
+  "status": "completed",
+  "task_id": "task-1"
+}

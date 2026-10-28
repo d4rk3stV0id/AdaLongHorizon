@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..models import IssueSpec, PlanStep, RepositorySnapshot, TaskState
+from ..models import BudgetLedger, IssueSpec, Plan, PlanStep, RepositorySnapshot, TaskState
 
 
 class DeterministicProvider:
@@ -64,3 +64,10 @@ class DeterministicProvider:
             }
 
         return {"type": "finish", "message": "No deterministic action is defined for this step."}
+
+    def propose_plan(self, issue: IssueSpec, snapshot: RepositorySnapshot, state: TaskState,
+                     budget: BudgetLedger, response_schema: dict) -> Plan:
+        """Expose the deterministic planner through the interchangeable provider contract."""
+        from ..planner import Planner
+
+        return Planner().create_deterministic_plan(issue, snapshot, state, budget)

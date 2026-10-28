@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
@@ -53,6 +54,10 @@ class StepStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+
+
+# PlanStep describes file mutations; "finish" remains an executor control action.
+PLAN_ACTION_TYPES = frozenset({"write_file", "edit_file"})
 
 
 # ---------------------------------------------------------------------------
@@ -110,17 +115,75 @@ class Plan:
     def validate(self) -> list[str]:
         """Return a list of validation errors (empty = valid)."""
         errors: list[str] = []
+        if not isinstance(self.issue_id, str) or not self.issue_id:
+            errors.append("plan has an invalid issue_id")
+        if not isinstance(self.steps, list):
+            return errors + ["plan steps must be a list"]
         if not self.steps:
             errors.append("plan has no steps")
+        if any(not isinstance(step, PlanStep) for step in self.steps):
+            return errors + ["plan contains an invalid step"]
+        if any(not isinstance(step.step_id, str) for step in self.steps):
+            return errors + ["plan contains a step with an invalid step_id"]
         ids = {s.step_id for s in self.steps}
         if len(ids) != len(self.steps):
             errors.append("duplicate step_id values")
         for step in self.steps:
-            if not step.step_id or not step.objective:
+            if (not isinstance(step.step_id, str) or not step.step_id.strip()
+                    or not isinstance(step.objective, str) or not step.objective.strip()):
                 errors.append(f"step missing step_id or objective")
-            for dep in step.dependencies:
-                if dep not in ids:
-                    errors.append(f"step '{step.step_id}' depends on unknown step '{dep}'")
+            valid_dependencies = isinstance(step.dependencies, list) and all(
+                isinstance(dep, str) for dep in step.dependencies
+            )
+            if not valid_dependencies:
+                errors.append(f"step '{step.step_id}' has invalid dependencies")
+            elif len(step.dependencies) != len(set(step.dependencies)):
+                errors.append(f"step '{step.step_id}' has duplicate dependencies")
+            if valid_dependencies:
+                for dep in step.dependencies:
+                    if dep not in ids:
+                        errors.append(f"step '{step.step_id}' depends on unknown step '{dep}'")
+            if not isinstance(step.action_type, str) or step.action_type not in PLAN_ACTION_TYPES:
+                errors.append(f"step '{step.step_id}' has unsupported action_type '{step.action_type}'")
+            if not isinstance(step.risk_level, str) or step.risk_level not in {"low", "medium", "high"}:
+                errors.append(f"step '{step.step_id}' has invalid risk_level '{step.risk_level}'")
+            if isinstance(step.estimated_cost, bool) or not isinstance(step.estimated_cost, int) or step.estimated_cost < 0:
+                errors.append(f"step '{step.step_id}' has invalid estimated_cost")
+            if (not isinstance(step.acceptance_checks, list)
+                    or not all(isinstance(check, str) for check in step.acceptance_checks)):
+                errors.append(f"step '{step.step_id}' has invalid acceptance_checks")
+            paths = step.expected_files if isinstance(step.expected_files, list) else []
+            if not isinstance(step.expected_files, list):
+                errors.append(f"step '{step.step_id}' has invalid expected_files")
+            for path in paths:
+                if not isinstance(path, str) or not path.strip():
+                    errors.append(f"step '{step.step_id}' has an invalid expected file path")
+                    continue
+                posix_path = PurePosixPath(path.replace("\\", "/"))
+                windows_path = PureWindowsPath(path)
+                if (posix_path.is_absolute() or windows_path.is_absolute()
+                        or ".." in posix_path.parts or ".." in windows_path.parts):
+                    errors.append(f"step '{step.step_id}' has an unsafe expected file path '{path}'")
+
+        graph = {step.step_id: step.dependencies for step in self.steps}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                errors.append(f"dependency cycle includes step '{step_id}'")
+                return
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for dependency in graph.get(step_id, []):
+                if dependency in graph:
+                    visit(dependency)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in graph:
+            visit(step_id)
         return errors
 
 
@@ -142,6 +205,9 @@ class BudgetLedger:
     tool_actions: int = 0
     retries: int = 0
     estimated_tokens: int = 0
+    actual_input_tokens: int = 0
+    actual_output_tokens: int = 0
+    actual_tokens: int = 0
     estimated_cost: float = 0.0
     consecutive_failures: int = 0
     last_failure_signature: str | None = None
@@ -154,7 +220,7 @@ class BudgetLedger:
             "llm": (self.llm_calls, self.max_llm_calls),
             "tool": (self.tool_actions, self.max_tool_actions),
             "retry": (self.retries, self.max_retries),
-            "tokens": (self.estimated_tokens, self.max_token_estimate),
+            "tokens": (self.estimated_tokens + self.actual_tokens, self.max_token_estimate),
         }
         if kind not in limits:
             raise ValueError(f"unknown budget kind: {kind}")
@@ -169,6 +235,31 @@ class BudgetLedger:
         self.check(kind, amount)
         attr = {"llm": "llm_calls", "tool": "tool_actions", "retry": "retries", "tokens": "estimated_tokens"}[kind]
         setattr(self, attr, getattr(self, attr) + amount)
+
+    def record_actual_usage(self, input_tokens: int, output_tokens: int,
+                            replace_estimated: int = 0) -> None:
+        """Replace a pre-call token estimate with actual provider usage.
+
+        The counts are retained even if the completed call takes the run over
+        its token budget; the budget error is raised after recording reality.
+        """
+        values = (input_tokens, output_tokens, replace_estimated)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("token usage values must be non-negative integers")
+        if replace_estimated > self.estimated_tokens:
+            raise ValueError("cannot replace more estimated tokens than have been recorded")
+        self.estimated_tokens -= replace_estimated
+        self.actual_input_tokens += input_tokens
+        self.actual_output_tokens += output_tokens
+        self.actual_tokens += input_tokens + output_tokens
+        self.check("tokens", 0)
+
+    def record_estimated_tokens(self, amount: int) -> None:
+        """Record a post-call estimate even when it reveals a budget overrun."""
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("estimated token amount must be a non-negative integer")
+        self.estimated_tokens += amount
+        self.check("tokens", 0)
 
     def record_cost(self, amount: float) -> None:
         if amount < 0:
@@ -278,10 +369,21 @@ class ToolResult:
 
 
 @dataclass
+class ExecutionRecord:
+    """Validated mutation input and the executor's immediate tool observation."""
+    step_id: str
+    expected_files: list[str]
+    action: dict[str, Any]
+    before_content: str | None
+    tool_result: ToolResult
+
+
+@dataclass
 class ObservationBundle:
     task_id: str
     results: list[ToolResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    execution_records: list[ExecutionRecord] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +399,7 @@ class RepositorySnapshot:
     baseline_commit: str | None
     baseline_status: str
     test_command: list[str] | None
+    target_file_contents: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
