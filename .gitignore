@@ -28,8 +28,9 @@ ada-demo-*/
 
 # Sensitive / non-repo docs
 temp_docs/
+docs/superpowers/
+docs/project/PROJECT_CONTEXT.md
 
 # OS
 Thumbs.db
 .DS_Store
-docs/project/PROJECT_CONTEXT.md
