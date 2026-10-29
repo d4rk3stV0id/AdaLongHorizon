@@ -15,6 +15,7 @@ venv/
 .pytest_cache/
 .pytest_tmp/
 .agent-state/
+.pytest-2d-trace-regression
 artifacts/
 
 # IDE

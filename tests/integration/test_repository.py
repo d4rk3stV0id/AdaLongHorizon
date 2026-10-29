@@ -235,8 +235,8 @@ def test_test_command_discovery(git_repo: Path):
 def test_checkpoint_and_diff(git_repo: Path):
     repo = RepositoryAdapter(git_repo)
     (git_repo / "initial.txt").write_text("init\n", encoding="utf-8")
-    subprocess.run(["git", "add", "initial.txt"], cwd=git_repo, check=True)
-    subprocess.run(["git", "commit", "-m", "init commit"], cwd=git_repo, check=True)
+    subprocess.run(["git", "add", "initial.txt"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init commit"], cwd=git_repo, check=True, capture_output=True)
 
     checkpoint = repo.checkpoint()
     assert checkpoint["commit"] is not None
