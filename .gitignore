@@ -11,12 +11,16 @@ build/
 .venv/
 venv/
 
-# Test/cache
-.pytest_cache/
-.pytest_tmp/
+# Test/cache/diagnostics
+.pytest*/
 .agent-state/
-.pytest-2d-trace-regression
 artifacts/
+
+# Disposable demo workspaces
+ada-*-demo-*/
+ada-*-demo*
+ada-demo-*/
+
 
 # IDE
 .vscode/
