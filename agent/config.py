@@ -14,4 +14,5 @@ def load_config(workspace: str | Path = ".") -> AgentConfig:
                        command_timeout_seconds=float(os.getenv("ADA_AGENT_COMMAND_TIMEOUT", "30")),
                        provider=os.getenv("ADA_AGENT_PROVIDER", "deterministic"),
                        ollama_host=os.getenv("ADA_OLLAMA_HOST", "http://localhost:11434"),
-                       llm_model=os.getenv("ADA_LLM_MODEL", "qwen3:8b"))
+                       llm_model=os.getenv("ADA_LLM_MODEL", "qwen3:8b"),
+                       max_rounds=int(os.getenv("ADA_AGENT_MAX_ROUNDS", "12")))

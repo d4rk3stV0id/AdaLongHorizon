@@ -384,6 +384,7 @@ class ObservationBundle:
     results: list[ToolResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     execution_records: list[ExecutionRecord] = field(default_factory=list)
+    audit_result: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -416,3 +417,4 @@ class AgentConfig:
     provider: str = "deterministic"
     ollama_host: str = "http://localhost:11434"
     llm_model: str = "qwen3:8b"
+    max_rounds: int = 12

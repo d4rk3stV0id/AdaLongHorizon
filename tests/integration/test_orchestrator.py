@@ -16,6 +16,7 @@ from agent.models import (
     StepStatus,
 )
 from agent.orchestrator import Orchestrator
+from agent.manager import ControlDecisionKind
 from agent.state.progress import RequirementStatus, create_progress_state
 
 
@@ -193,6 +194,47 @@ def test_persistent_run_reloads_verified_state_between_two_fresh_rounds(git_repo
     assert all(state is not other_state for state, _ in rounds for other_state, _ in rounds if state is not other_state)
     assert [item.status for item in progress.requirements] == [RequirementStatus.COMPLETED, RequirementStatus.COMPLETED]
     assert progress.status.value == "completed"
+
+
+def test_mea_loop_uses_explicit_decisions_and_fresh_bounded_contracts(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    orchestrator = Orchestrator(AgentConfig(workspace=str(git_repo)), DeterministicProvider())
+    decisions = []
+    original_decide = orchestrator.manager.decide
+
+    def record_decision(progress, budget, *, max_rounds):
+        decision = original_decide(progress, budget, max_rounds=max_rounds)
+        decisions.append(decision)
+        return decision
+
+    orchestrator.manager.decide = record_decision
+    issue = IssueSpec("Add normalize_whitespace", "Add a function to normalize whitespace in strings and tests", ["function exists", "pytest passes"])
+
+    progress, rounds = orchestrator.run_persistent(issue)
+
+    assert [item.kind for item in decisions] == [
+        ControlDecisionKind.EXECUTE, ControlDecisionKind.EXECUTE, ControlDecisionKind.DONE,
+    ]
+    assert [item.contract.requirement_ids for item in decisions[:2]] == [["R1"], ["R2"]]
+    assert decisions[1].contract.verified_facts
+    assert all("execution_records" not in item.contract.planner_context() for item in decisions[:2])
+    assert rounds[0][0] is not rounds[1][0]
+    assert progress.status.value == "completed"
+
+
+def test_mea_round_limit_blocks_without_manufacturing_completion(git_repo: Path):
+    (git_repo / "pyproject.toml").write_text("", encoding="utf-8")
+    config = AgentConfig(workspace=str(git_repo), max_rounds=1)
+    orchestrator = Orchestrator(config, DeterministicProvider())
+    issue = IssueSpec("Add normalize_whitespace", "Add a function to normalize whitespace in strings and tests", ["function exists", "pytest passes"])
+
+    progress, rounds = orchestrator.run_persistent(issue)
+
+    assert len(rounds) == 1
+    assert progress.status.value == "blocked"
+    assert [item.status for item in progress.requirements] == [
+        RequirementStatus.COMPLETED, RequirementStatus.PENDING,
+    ]
 
 
 def test_persistent_run_stops_after_a_rejected_first_round(git_repo: Path):

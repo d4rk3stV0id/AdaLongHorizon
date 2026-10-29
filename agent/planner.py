@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, get_args, get_origin, get_type_hints
 
 from .llm.base import LLMProvider, LLMResponse
+from .manager import BoundedExecutionContract
 from .models import (
     BudgetLedger, IssueSpec, PLAN_ACTION_TYPES, Plan, PlanStep, RepositorySnapshot,
     StepStatus, TaskState,
@@ -87,8 +88,11 @@ class Planner:
         state: TaskState,
         budget: BudgetLedger | None = None,
         persistent_state: PersistentTaskState | None = None,
+        contract: BoundedExecutionContract | None = None,
     ) -> Plan:
-        if persistent_state is not None:
+        if contract is not None:
+            state.transient["persistent_context"] = contract.planner_context()
+        elif persistent_state is not None:
             state.transient["persistent_context"] = {
                 "pending_requirements": [
                     {"requirement_id": item.requirement_id, "description": item.description}

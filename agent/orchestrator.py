@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .errors import BudgetExceeded
 from .executor import Executor
+from .manager import BoundedExecutionContract, ControlDecisionKind, MEAManager
 from .llm.provider import DeterministicProvider
 from .models import (
     AgentConfig, BudgetLedger, IssueSpec, Lifecycle, ObservationBundle,
@@ -48,6 +49,7 @@ class Orchestrator:
             self.provider = DeterministicProvider()
         self.planner = Planner(self.provider if config.provider == "ollama" else None)
         self.verifier = Verifier()
+        self.manager = MEAManager()
         self.last_run_trace: RunTrace | None = None
 
     def run(
@@ -55,6 +57,7 @@ class Orchestrator:
         persistent_state: PersistentTaskState | None = None,
         requirement_checks: dict[str, list[str]] | None = None,
         round_id: int = 1,
+        contract: BoundedExecutionContract | None = None,
     ) -> tuple[TaskState, ObservationBundle]:
         state = TaskState(
             issue,
@@ -74,6 +77,7 @@ class Orchestrator:
             state.transition(Lifecycle.PLANNING)
             state.plan = self.planner.create_plan(
                 issue, snapshot, state, state.budget, persistent_state=persistent_state,
+                contract=contract,
             )
             self._save_event(state, "plan_created", {
                 "steps": [s.step_id for s in state.plan.steps],
@@ -98,6 +102,7 @@ class Orchestrator:
             test_result = self.repository.run_command(test_command, timeout=state.budget.command_timeout_seconds)
             obs.results.append(test_result)
             verification = self.verifier.verify(self.repository, obs.execution_records, test_result)
+            obs.audit_result = verification
             state.transient["verification_result"] = verification.to_dict()
             obs.notes.append(f"Independent verification: {verification.status.value}.")
             if verification.failures:
@@ -165,7 +170,7 @@ class Orchestrator:
     def run_persistent(
         self, issue: IssueSpec, budget: BudgetLedger | None = None,
     ) -> tuple[PersistentTaskState, list[tuple[TaskState, ObservationBundle]]]:
-        """Run fresh bounded execution contexts against one durable task state."""
+        """Create durable progress, then run the explicit bounded M3 MEA loop."""
         run_started = perf_counter()
         self.last_run_trace = None
         shared_budget = budget or BudgetLedger(command_timeout_seconds=self.config.command_timeout_seconds)
@@ -174,21 +179,22 @@ class Orchestrator:
         progress = create_progress_state(task_id, issue)
         self.store.save_progress(progress)
         rounds: list[tuple[TaskState, ObservationBundle]] = []
-        max_rounds = len(progress.requirements)
-        for round_id in range(1, max_rounds + 1):
-            if progress.status != ProgressStatus.IN_PROGRESS:
-                break
-            requirement = next(
-                (item for item in progress.requirements if item.status.value == "pending"), None,
+        while True:
+            decision = self.manager.decide(
+                progress, shared_budget, max_rounds=self.config.max_rounds,
             )
-            if requirement is None:
+            if decision.kind == ControlDecisionKind.DONE:
                 break
-            pending_issue = IssueSpec(
-                title=issue.title,
-                description=issue.description + f"\nCurrent round requirement ({requirement.requirement_id}): {requirement.description}",
-                acceptance_criteria=[requirement.description],
-                issue_id=issue.issue_id,
-            )
+            if decision.kind == ControlDecisionKind.BLOCKED:
+                progress.status = ProgressStatus.BLOCKED
+                self.store.save_progress(progress)
+                break
+
+            contract = decision.contract
+            if contract is None:  # Defensive: EXECUTE decisions must always carry a contract.
+                progress.status = ProgressStatus.BLOCKED
+                self.store.save_progress(progress)
+                break
             started = perf_counter()
             previously_completed = {
                 item.requirement_id for item in progress.requirements
@@ -201,14 +207,17 @@ class Orchestrator:
             ]
             tools_before = shared_budget.tool_actions
             state, observations = self.run(
-                pending_issue, shared_budget, persistent_state=progress, round_id=round_id,
+                contract.to_issue(progress.issue), shared_budget, persistent_state=progress,
+                round_id=contract.round_id, contract=contract,
             )
             rounds.append((state, observations))
-            raw = state.transient.get("verification_result", {})
-            verification = self.verifier.verify(
-                self.repository, observations.execution_records,
-                next((r for r in reversed(observations.results) if r.operation == "run_command"), None),
-            )
+            verification = observations.audit_result
+            if verification is None:
+                # A failed runtime cannot manufacture audit success.
+                progress.status = ProgressStatus.BLOCKED
+                self.store.save_progress(progress)
+                progress = self.store.load_progress(task_id)
+                break
             mapped_checks = sorted({
                 check.name
                 for index, record in enumerate(observations.execution_records)
@@ -221,16 +230,16 @@ class Orchestrator:
             )
             if mapped_checks:
                 update_from_verification(
-                    progress, verification, {requirement.requirement_id: mapped_checks},
-                    test_result, round_id,
+                    progress, verification, {contract.requirement_ids[0]: mapped_checks},
+                    test_result, contract.round_id,
                 )
             newly_verified = sum(
                 item.status.value == "completed" and item.requirement_id not in previously_completed
                 for item in progress.requirements
             )
-            trace = progress.rounds[-1] if progress.rounds and progress.rounds[-1].round_id == round_id else None
+            trace = progress.rounds[-1] if progress.rounds and progress.rounds[-1].round_id == contract.round_id else None
             if trace is None:
-                trace = RoundTrace(task_id, round_id)
+                trace = RoundTrace(task_id, contract.round_id)
                 progress.rounds.append(trace)
             usage = state.transient.get("llm_usage", [])
             provider_usage = summarize_provider_usage(
@@ -253,6 +262,10 @@ class Orchestrator:
             trace.pending_requirement_ids = pending_ids_before
             trace.newly_verified_requirements = newly_verified
             trace.final_outcome = state.status.value.lower()
+            requirement = next(
+                item for item in progress.requirements
+                if item.requirement_id == contract.requirement_ids[0]
+            )
             if requirement.status.value != "completed" or newly_verified == 0:
                 progress.status = ProgressStatus.BLOCKED
             for record in observations.execution_records:
