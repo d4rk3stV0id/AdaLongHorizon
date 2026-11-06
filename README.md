@@ -78,3 +78,17 @@ verifier does not retry or modify repository state. Persistent cross-round state
 is available through the bounded orchestration and is demonstrated by
 `multi-round-demo`. Recovery, adaptive budgets, and benchmark infrastructure
 remain outside this phase.
+
+## M4 dynamic replanning
+
+Within a bounded M3 runtime round, M4 classifies execution evidence and may
+perform a safe retry or request a revised remaining plan. Revisions are scoped
+to the Manager-selected requirement, reuse the existing Planner/provider, and
+are bounded by retry, no-progress, and replan limits. Before retrying an
+ambiguous timeout, the agent performs a read-only postcondition assessment; an
+already-achieved postcondition is never repeated. Revision history is retained
+in round/run traces only, and active plans are not restored across rounds.
+
+Executor outcomes and intermediate assessments are not durable completion
+evidence. A requirement becomes complete only after final independent
+verification supplies mapped passing checks and the required test command passes.
