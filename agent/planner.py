@@ -58,7 +58,7 @@ def _dataclass_schema(model: type, excluded: set[str] | None = None) -> dict[str
 def plan_response_schema() -> dict[str, Any]:
     """Return the proposal subset of Plan/PlanStep, leaving runtime fields local."""
     step_schema = _dataclass_schema(
-        PlanStep, excluded={"status", "attempts", "evidence_refs"},
+        PlanStep, excluded={"status", "attempts", "evidence_refs", "requirement_ids", "completion_conditions", "constraints"},
     )
     # Keep these fields aligned with the domain constraints applied by Plan.validate.
     step_schema["properties"]["action_type"] = {
@@ -69,7 +69,9 @@ def plan_response_schema() -> dict[str, Any]:
     }
     step_schema["required"] = list(step_schema["properties"])
 
-    plan_schema = _dataclass_schema(Plan, excluded={"issue_id", "created_at"})
+    plan_schema = _dataclass_schema(
+        Plan, excluded={"issue_id", "created_at", "plan_id", "version", "objective", "requirement_ids", "revision_reason", "parent_plan_id"},
+    )
     plan_schema["properties"]["steps"]["items"] = step_schema
     plan_schema["required"] = ["steps"]
     return plan_schema
@@ -105,6 +107,18 @@ class Planner:
         if self.provider is None:
             return self.create_deterministic_plan(issue, snapshot, state, budget)
         return self._create_provider_plan(issue, snapshot, state, budget or state.budget)
+
+    def create_revised_plan(
+        self,
+        issue: IssueSpec,
+        snapshot: RepositorySnapshot,
+        state: TaskState,
+        budget: BudgetLedger,
+        replanning_context: dict[str, Any],
+    ) -> Plan:
+        """Reuse the current planner/provider with bounded, explicit revision context."""
+        state.transient["replanning_context"] = replanning_context
+        return self.create_plan(issue, snapshot, state, budget)
 
     def create_deterministic_plan(
         self,

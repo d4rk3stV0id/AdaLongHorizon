@@ -56,6 +56,29 @@ class StepStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class ExecutionOutcomeKind(StrEnum):
+    """Classification of one bounded execution attempt, never completion evidence."""
+
+    PROGRESS = "progress"
+    RECOVERABLE_FAILURE = "recoverable_failure"
+    PLAN_INVALIDATED = "plan_invalidated"
+    NO_PROGRESS = "no_progress"
+    OPERATION_BLOCKED = "operation_blocked"
+    TERMINAL_BLOCKER = "terminal_blocker"
+
+
+class InvalidationReason(StrEnum):
+    TRANSIENT_TIMEOUT = "transient_timeout"
+    TRANSIENT_PROVIDER = "transient_provider"
+    MISSING_RESOURCE = "missing_resource"
+    UNAVAILABLE_OPERATION = "unavailable_operation"
+    CONTRADICTED_ASSUMPTION = "contradicted_assumption"
+    REPEATED_NO_PROGRESS = "repeated_no_progress"
+    PERMISSION_DENIED = "permission_denied"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    UNSAFE_RETRY = "unsafe_retry"
+
+
 # PlanStep describes file mutations; "finish" remains an executor control action.
 PLAN_ACTION_TYPES = frozenset({"write_file", "edit_file"})
 
@@ -99,6 +122,9 @@ class PlanStep:
     status: StepStatus = StepStatus.PENDING
     attempts: int = 0
     evidence_refs: list[str] = field(default_factory=list)
+    requirement_ids: list[str] = field(default_factory=list)
+    completion_conditions: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
 
     # Convenience backward-compat alias
     @property
@@ -111,12 +137,20 @@ class Plan:
     issue_id: str
     steps: list[PlanStep]
     created_at: str = field(default_factory=utc_now)
+    plan_id: str = field(default_factory=lambda: str(uuid4()))
+    version: int = 1
+    objective: str = ""
+    requirement_ids: list[str] = field(default_factory=list)
+    revision_reason: str | None = None
+    parent_plan_id: str | None = None
 
     def validate(self) -> list[str]:
         """Return a list of validation errors (empty = valid)."""
         errors: list[str] = []
         if not isinstance(self.issue_id, str) or not self.issue_id:
             errors.append("plan has an invalid issue_id")
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
+            errors.append("plan has an invalid version")
         if not isinstance(self.steps, list):
             return errors + ["plan steps must be a list"]
         if not self.steps:
@@ -376,6 +410,28 @@ class ExecutionRecord:
     action: dict[str, Any]
     before_content: str | None
     tool_result: ToolResult
+    active: bool = True
+
+
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    step_id: str | None
+    kind: ExecutionOutcomeKind
+    reason: InvalidationReason | None
+    signature: str
+    retryable: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class ReplanHistoryEntry:
+    from_plan_id: str
+    from_version: int
+    outcome_signature: str
+    result: str
+    reason: str
+    to_plan_id: str | None = None
+    to_version: int | None = None
 
 
 @dataclass
@@ -418,3 +474,6 @@ class AgentConfig:
     ollama_host: str = "http://localhost:11434"
     llm_model: str = "qwen3:8b"
     max_rounds: int = 12
+    max_replans: int = 2
+    max_safe_retries: int = 1
+    no_progress_threshold: int = 2

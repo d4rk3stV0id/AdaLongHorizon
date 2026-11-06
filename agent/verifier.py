@@ -17,6 +17,12 @@ class VerificationStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class AssessmentStatus(StrEnum):
+    ACHIEVED = "achieved"
+    NOT_ACHIEVED = "not_achieved"
+    INDETERMINATE = "indeterminate"
+
+
 @dataclass
 class VerificationCheck:
     name: str
@@ -46,6 +52,15 @@ class VerificationResult:
         }
 
 
+@dataclass
+class IntermediateAssessment:
+    """Read-only per-action observation; deliberately not durable verification."""
+
+    status: AssessmentStatus
+    checks: list[VerificationCheck] = field(default_factory=list)
+    detail: str = ""
+
+
 class Verifier:
     """Compare the observed repository with validated actions and test results."""
 
@@ -66,7 +81,9 @@ class Verifier:
             if not passed:
                 failures.append(f"{name}: {detail}")
 
-        valid_records = isinstance(execution_records, list) and bool(execution_records)
+        valid_records = isinstance(execution_records, list) and any(
+            isinstance(record, ExecutionRecord) and record.active for record in execution_records
+        )
         record_check(
             "execution_records_present", valid_records,
             "at least one executed file mutation is required" if not valid_records else "execution records were provided",
@@ -80,6 +97,8 @@ class Verifier:
                         f"execution_record_{index}_valid", False,
                         "execution record is malformed", record_type=type(record).__name__,
                     )
+                    continue
+                if not record.active:
                     continue
 
                 try:
@@ -192,6 +211,35 @@ class Verifier:
 
         status = VerificationStatus.REJECTED if failures else VerificationStatus.VERIFIED
         return VerificationResult(status, checks, failures, evidence)
+
+    def assess_execution_record(
+        self, repository: RepositoryAdapter, record: ExecutionRecord | None,
+    ) -> IntermediateAssessment:
+        """Inspect one action's direct postcondition without running tests or updating state."""
+        if not isinstance(record, ExecutionRecord):
+            return IntermediateAssessment(AssessmentStatus.INDETERMINATE, detail="execution record is missing or malformed")
+        try:
+            action = Action.validate(record.action)
+        except (AttributeError, TypeError, ValueError) as exc:
+            return IntermediateAssessment(AssessmentStatus.INDETERMINATE, detail=f"action is malformed: {exc}")
+        if action.type not in PLAN_ACTION_TYPES or not action.path:
+            return IntermediateAssessment(AssessmentStatus.INDETERMINATE, detail="action has no assessable file postcondition")
+        try:
+            observed = repository.read_file(action.path)
+        except (RepositoryError, OSError, UnicodeError):
+            return IntermediateAssessment(AssessmentStatus.NOT_ACHIEVED, detail="target file is missing or unreadable")
+        try:
+            expected = action.content if action.type == "write_file" else self._apply_edits(record.before_content or "", action.edits or [])
+        except ValueError as exc:
+            return IntermediateAssessment(AssessmentStatus.INDETERMINATE, detail=f"postcondition cannot be derived: {exc}")
+        passed = observed == expected
+        return IntermediateAssessment(
+            AssessmentStatus.ACHIEVED if passed else AssessmentStatus.NOT_ACHIEVED,
+            [VerificationCheck("intermediate_repository_state", passed,
+                               "repository content matches action postcondition" if passed else "repository content differs from action postcondition",
+                               {"path": action.path})],
+            "direct action postcondition assessed",
+        )
 
     @staticmethod
     def _apply_edits(before_content: str, edits: list[dict[str, str]]) -> str:

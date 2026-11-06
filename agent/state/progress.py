@@ -20,6 +20,7 @@ _ROUND_TRACE_REQUIRED_FIELDS = {
 _ROUND_TRACE_OPTIONAL_FIELDS = {
     "provider_latency_ms", "planning_result", "pending_requirements",
     "pending_requirement_ids", "newly_verified_requirements",
+    "revision_history",
 }
 
 
@@ -63,6 +64,7 @@ class RoundTrace:
     pending_requirement_ids: list[str] = field(default_factory=list)
     newly_verified_requirements: int | None = None
     final_outcome: str | None = None
+    revision_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -333,6 +335,8 @@ def _round_trace_from_dict(value: Any) -> RoundTrace:
     if not isinstance(value["pending_requirement_ids"], list) or not all(
         isinstance(item, str) and item.strip() for item in value["pending_requirement_ids"]
     ):
+        raise ValueError("malformed round trace")
+    if not isinstance(value["revision_history"], list) or not all(isinstance(item, dict) for item in value["revision_history"]):
         raise ValueError("malformed round trace")
     if any(value[name] is not None and not isinstance(value[name], str) for name in ("planning_result", "verification_result", "final_outcome")):
         raise ValueError("malformed round trace")

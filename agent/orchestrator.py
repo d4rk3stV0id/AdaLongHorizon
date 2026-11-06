@@ -8,6 +8,7 @@ adaptive verification, and sophisticated recovery belong to Phase 4+.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -15,6 +16,7 @@ from uuid import uuid4
 from .errors import BudgetExceeded
 from .executor import Executor
 from .manager import BoundedExecutionContract, ControlDecisionKind, MEAManager
+from .replanning import ReplanDecisionKind, ReplanningController
 from .llm.provider import DeterministicProvider
 from .models import (
     AgentConfig, BudgetLedger, IssueSpec, Lifecycle, ObservationBundle,
@@ -79,6 +81,8 @@ class Orchestrator:
                 issue, snapshot, state, state.budget, persistent_state=persistent_state,
                 contract=contract,
             )
+            if contract is not None:
+                state.plan.requirement_ids = list(contract.requirement_ids)
             self._save_event(state, "plan_created", {
                 "steps": [s.step_id for s in state.plan.steps],
                 "llm_usage": state.transient.get("last_llm_usage"),
@@ -87,13 +91,63 @@ class Orchestrator:
             # --- EXECUTING ---
             state.transition(Lifecycle.EXECUTING)
             executor = Executor(self.repository, self.provider)
+            replanning = ReplanningController(self.config, self.verifier)
             while executor.eligible_step(state):
-                if not executor.execute_next(state, snapshot, obs):
-                    break
-                self._save_event(state, "step_executed", {
-                    "step": state.transient.get("last_step"),
-                    "llm_usage": state.transient.get("last_llm_usage"),
+                before_records = len(obs.execution_records)
+                try:
+                    executed = executor.execute_next(state, snapshot, obs)
+                    error = None
+                except Exception as exc:
+                    executed = False
+                    error = exc
+                record = obs.execution_records[-1] if len(obs.execution_records) > before_records else None
+                assessment = self.verifier.assess_execution_record(self.repository, record) if record else None
+                outcome = replanning.classify(record, assessment, error)
+                if isinstance(error, BudgetExceeded):
+                    raise error
+                decision = replanning.decide(outcome, assessment)
+                state.transient.setdefault("execution_outcomes", []).append({
+                    "kind": outcome.kind.value, "reason": outcome.reason.value if outcome.reason else None,
+                    "signature": outcome.signature, "detail": outcome.detail,
+                    "assessment": assessment.status.value if assessment else None,
                 })
+                if decision == ReplanDecisionKind.CONTINUE and executed:
+                    self._save_event(state, "step_executed", {
+                        "step": state.transient.get("last_step"),
+                        "llm_usage": state.transient.get("last_llm_usage"),
+                    })
+                    continue
+                if decision == ReplanDecisionKind.RETRY:
+                    if record is not None:
+                        record.active = False
+                    step = next((item for item in state.plan.steps if item.step_id == outcome.step_id), None)
+                    if step is not None:
+                        step.status = StepStatus.PENDING
+                    continue
+                if decision == ReplanDecisionKind.REPLAN and contract is not None and state.plan is not None:
+                    old_plan = state.plan
+                    replan_snapshot = self.repository.inspect()
+                    try:
+                        candidate = self.planner.create_revised_plan(
+                            issue, replan_snapshot, state, state.budget,
+                            replanning.context(state, contract, replan_snapshot),
+                        )
+                        errors = replanning.validate_candidate(candidate, state, contract, replan_snapshot)
+                    except Exception as exc:
+                        candidate, errors = None, [f"revision proposal failed: {type(exc).__name__}: {exc}"]
+                    if candidate is not None and not errors:
+                        replanning.activate(old_plan, candidate, contract, replan_snapshot, outcome)
+                        if record is not None:
+                            record.active = False
+                        state.plan = candidate
+                        self._save_event(state, "plan_revised", {"version": candidate.version, "reason": candidate.revision_reason})
+                        continue
+                    replanning.reject(old_plan, outcome, "; ".join(errors))
+                if error is not None:
+                    state.transient["error"] = f"{type(error).__name__}: {error}"
+                obs.notes.append(f"Execution stopped: {outcome.kind.value}: {outcome.detail}")
+                break
+            state.transient["replan_history"] = [asdict(item) for item in replanning.history]
 
             # --- VERIFYING ---
             state.transition(Lifecycle.VERIFYING)
@@ -262,6 +316,7 @@ class Orchestrator:
             trace.pending_requirement_ids = pending_ids_before
             trace.newly_verified_requirements = newly_verified
             trace.final_outcome = state.status.value.lower()
+            trace.revision_history = list(state.transient.get("replan_history", []))
             requirement = next(
                 item for item in progress.requirements
                 if item.requirement_id == contract.requirement_ids[0]
