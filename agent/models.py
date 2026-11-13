@@ -414,6 +414,52 @@ class ExecutionRecord:
 
 
 @dataclass(frozen=True)
+class JournalIntent:
+    """Durable declaration written before a repository mutation."""
+    sequence: int
+    action_id: str
+    task_id: str
+    repository_id: str
+    plan_id: str
+    plan_version: int
+    step_id: str
+    action: dict[str, Any]
+    expected_files: list[str]
+    before_content: str | None
+    timestamp: str = field(default_factory=utc_now)
+    kind: str = "intent"
+
+
+@dataclass(frozen=True)
+class JournalOutcome:
+    sequence: int
+    action_id: str
+    task_id: str
+    repository_id: str
+    status: str
+    tool_result: dict[str, Any] | None
+    timestamp: str = field(default_factory=utc_now)
+    kind: str = "outcome"
+    plan_id: str | None = None
+    plan_version: int | None = None
+    step_id: str | None = None
+
+
+@dataclass
+class RecoveryCheckpoint:
+    """Versioned runtime knowledge snapshot; never independent completion evidence."""
+    schema_version: int
+    task_id: str
+    repository_id: str
+    journal_position: int
+    runtime_state: dict[str, Any]
+    repository_observation: dict[str, Any]
+    replanning_state: dict[str, Any] = field(default_factory=dict)
+    persistent_task_id: str | None = None
+    created_at: str = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
 class ExecutionOutcome:
     step_id: str | None
     kind: ExecutionOutcomeKind

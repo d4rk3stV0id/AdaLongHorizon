@@ -1,94 +1,201 @@
 # AdaLongHorizon
 
-Budget-aware long-horizon software engineering agent research prototype.
+AdaLongHorizon is a research prototype for a budget-aware software engineering
+agent. It inspects a local Git repository, creates a structured plan, executes
+validated file operations, and independently verifies the result with the
+repository's test command.
+
+The project makes progress and completion distinct. An executor can report an
+operation succeeded, but a requirement becomes durable only after the
+independent verifier confirms the relevant evidence and tests pass.
+
+## What it demonstrates
+
+- Structured planning with versioned `Plan` and `PlanStep` models.
+- Repository inspection, constrained file operations, and command execution.
+- Independent verification of changed artifacts and test results.
+- Persistent requirement state across bounded runtime rounds.
+- Dynamic replanning for a selected requirement, with bounded retries
+  and replans.
+- Atomic checkpoints, action journaling, process ownership, and recovery of
+  safely reconcilable interrupted work.
+- A deterministic provider for repeatable demos and an optional local Ollama
+  provider for structured model-backed planning and execution.
 
 ## Requirements
 
-Python 3.11+ and Git. The demonstration uses pytest in a disposable temporary repository.
+- Python 3.11 or later
+- Git, for repository inspection and the disposable demos
+- `pytest`, installed by the development extra
 
-## Run
+Optional Ollama demos also require a running [Ollama](https://ollama.com/)
+service and an installed model.
+
+## Install
 
 ```powershell
 py -m pip install -e ".[dev]"
-py -m agent demo
-py -m agent multi-round-demo
-py -m agent llm-smoke-test
-py -m agent executor-ollama-smoke
-py -m agent ollama-demo
-py -m agent ollama-multi-round-demo
-py -m pytest
 ```
 
-The deterministic demo remains the default. The separate `llm-smoke-test`
-command sends one JSON-schema-constrained request to Ollama and prints the
-structured response and Ollama-reported usage. Configure it with
-`ADA_OLLAMA_HOST` (default `http://localhost:11434`) and `ADA_LLM_MODEL`
-(default `qwen3:8b`). It does not inspect or modify a repository.
+The package exposes the `ada-agent` console entry point. The examples below
+use `py -m agent`, which works directly from a checkout.
 
-`demo` explicitly uses the deterministic Planner and provider. Set
-`ADA_AGENT_PROVIDER=ollama` to select the Ollama-backed Planner and Executor
-through the Orchestrator. `ollama-demo` is the explicit disposable end-to-end
-path and uses `ADA_OLLAMA_HOST` and `ADA_LLM_MODEL` for its local model.
-`ollama-multi-round-demo` uses the same local provider in a disposable
-repository, but runs two independent requirements through persistent multi-round
-orchestration and reports the measured run trace. It requires the configured
-Ollama service and model to be available.
+## Quick start
 
-`executor-ollama-smoke` runs one model-generated action through the existing
-Executor in a disposable workspace, then runs its small pytest fixture there.
-It never falls back to the deterministic provider.
+Run the deterministic end-to-end example:
 
-The LLM Planner uses Ollama JSON-Schema structured output derived from the
-existing `Plan` and `PlanStep` dataclasses. Actual input/output usage is stored
-in the `BudgetLedger` when returned by the provider; only calls without usage
-metadata remain estimated.
+```powershell
+py -m agent demo
+```
 
-Ollama requests explicitly set `think=false` for this milestone. The API can
-return a separate `message.thinking` field; the provider exposes whether that
-field was present. Ollama reports one `eval_count` value without a separate
-thinking-token count, so the agent does not infer or subtract reasoning tokens.
-See the [Ollama thinking API documentation](https://docs.ollama.com/capabilities/thinking).
+It creates a temporary Git repository, plans a small implementation task,
+writes the proposed files through the executor, runs pytest, and prints a JSON
+summary. The current checkout is not changed.
 
-The demo creates a tiny Python repository, inspects it, plans two file changes,
-executes validated write actions, runs its discovered test command, and prints
-structured observations. It does not modify this checkout.
+Choose the alternate deterministic task:
 
-`multi-round-demo` builds a separate temporary repository and runs two
-independent requirements through the persistent-state orchestration. It prints
-the pending requirements and newly verified count for each round, the final
-state, trace summary, and temporary repository diff. The deterministic provider
-makes no LLM calls, so token and provider-latency fields are reported as
-unavailable. To reproduce the run, use the command above with the built-in
-deterministic provider and the discovered `python -m pytest -q` command. For
-provider-backed runs, `Orchestrator.last_run_trace` contains measured usage when
-the provider reports it; unavailable token fields remain `None`.
+```powershell
+py -m agent demo --task normalize
+```
 
-For Ollama action generation, the Executor includes only existing files named
-by the current step's `expected_files`, capped at 8,000 characters total.
-Localized changes use `edit_file`, which atomically replaces one or more exact,
-unique, non-overlapping text spans in the same file. Missing or ambiguous text
-rejects the whole action without modifying the file. `write_file`
-remains available for new files and intentional full-file replacement.
+## Architecture
 
-The Orchestrator records each validated mutation separately from its execution
-result, then runs a deterministic read-only verifier over the actual target file
-contents and test-command result. `COMPLETED` now requires both completed plan
-steps and a verified result. A rejected result leaves the round `BLOCKED`; the
-verifier does not retry or modify repository state. Persistent cross-round state
-is available through the bounded orchestration and is demonstrated by
-`multi-round-demo`. Recovery, adaptive budgets, and benchmark infrastructure
-remain outside this phase.
+```text
+Issue specification
+        |
+Repository inspection --> Planner --> versioned active plan
+                                      |
+                                      v
+                               Executor + action journal
+                                      |
+                                      v
+                         Intermediate postcondition assessment
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+              bounded retry/replan              final verification
+                                                        |
+                                                        v
+                                      durable verified requirement progress
+```
 
-## M4 dynamic replanning
+| Component | Responsibility |
+| --- | --- |
+| `RepositoryAdapter` | Inspects a workspace, reads and writes approved files, and discovers a pytest command. |
+| `Planner` | Produces structured plans and revised remaining plans. |
+| `Executor` | Validates and applies one planned operation at a time. |
+| `Verifier` | Assesses intermediate postconditions and performs final independent verification. |
+| `MEAManager` | Selects the current requirement and bounds persistent rounds. |
+| `ReplanningController` | Classifies execution outcomes and permits bounded retry or replanning within one round. |
+| `StateStore` and recovery module | Persist verified progress, checkpoints, action journals, and task ownership locks. |
 
-Within a bounded M3 runtime round, M4 classifies execution evidence and may
-perform a safe retry or request a revised remaining plan. Revisions are scoped
-to the Manager-selected requirement, reuse the existing Planner/provider, and
-are bounded by retry, no-progress, and replan limits. Before retrying an
-ambiguous timeout, the agent performs a read-only postcondition assessment; an
-already-achieved postcondition is never repeated. Revision history is retained
-in round/run traces only, and active plans are not restored across rounds.
+### Completion and recovery guarantees
 
-Executor outcomes and intermediate assessments are not durable completion
-evidence. A requirement becomes complete only after final independent
-verification supplies mapped passing checks and the required test command passes.
+- Executor success and intermediate assessment are not durable requirement
+  completion evidence.
+- Only normal final verification can update durable verified requirement state.
+- Plan revisions apply only to the requirement selected for the current runtime
+  round.
+  Plans are not restored across later rounds.
+- Before retrying an ambiguous action such as a timeout, the agent examines the
+  intended postcondition. An achieved postcondition is never blindly repeated.
+- The recovery system writes atomic, versioned checkpoints and records intent before a side
+  effect and outcome afterward.
+- Recovery validates the full journal, reconciles only records after the
+  checkpoint position, and blocks when an in-flight action cannot be safely
+  reconciled.
+- Ownership is task-scoped and process-level. On Windows it uses `msvcrt`
+  byte-range locking; nested acquisition is permitted only on the owning thread.
+
+## Demos
+
+All demos print JSON and use disposable workspaces unless noted otherwise.
+
+| Command | Provider | What it runs |
+| --- | --- | --- |
+| `py -m agent demo` | Deterministic | A complete single-task planning, execution, and verification cycle. |
+| `py -m agent demo --task normalize` | Deterministic | The whitespace-normalization variant of the single-task demo. |
+| `py -m agent multi-round-demo` | Deterministic | Two independently verified requirements through persistent rounds. |
+| `py -m agent llm-smoke-test` | Ollama | One schema-constrained model request; it does not inspect or modify a repository. |
+| `py -m agent executor-ollama-smoke` | Ollama | One model-generated executor action and its fixture test. |
+| `py -m agent ollama-demo` | Ollama | Full planning, execution, and verification in a temporary repository. |
+| `py -m agent ollama-multi-round-demo` | Ollama | Two persistent rounds with provider usage and run-trace output. |
+
+The deterministic demos make no model calls. `multi-round-demo` and the
+Ollama multi-round demo report round traces, including verified progress and
+available provider usage.
+
+## Ollama setup
+
+Set the local service and model before running any Ollama command:
+
+```powershell
+$env:ADA_OLLAMA_HOST = "http://localhost:11434"
+$env:ADA_LLM_MODEL = "qwen3:8b"
+py -m agent ollama-demo
+```
+
+The provider requests JSON-schema-constrained output derived from the plan
+models. It records provider-reported token usage when available. The current
+implementation sends `think=false`; it does not infer separate reasoning-token
+counts from Ollama responses.
+
+## Configuration
+
+Configuration comes from environment variables. Defaults are chosen for the
+deterministic local demos.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ADA_AGENT_PROVIDER` | `deterministic` | Provider selected by the orchestrator; set to `ollama` for model-backed execution. |
+| `ADA_OLLAMA_HOST` | `http://localhost:11434` | Ollama HTTP endpoint. |
+| `ADA_LLM_MODEL` | `qwen3:8b` | Ollama model name. |
+| `ADA_AGENT_STATE_DIR` | `.agent-state` | Directory for task state, checkpoints, journals, and events. |
+| `ADA_AGENT_COMMAND_TIMEOUT` | `30` | Per-command timeout in seconds. |
+| `ADA_AGENT_MAX_ROUNDS` | `12` | Maximum persistent rounds. |
+| `ADA_AGENT_MAX_REPLANS` | `2` | Maximum plan revisions per round. |
+| `ADA_AGENT_MAX_SAFE_RETRIES` | `1` | Maximum safe retries per round. |
+| `ADA_AGENT_NO_PROGRESS_THRESHOLD` | `2` | Repeated no-progress threshold before execution stops. |
+
+## Testing
+
+The repository configures pytest to use importlib import mode, so the normal
+commands work even though unit and integration tests intentionally share some
+module basenames.
+
+```powershell
+py -m pytest tests/unit -q
+py -m pytest tests/integration -q
+py -m pytest -q
+```
+
+The suite covers planner and executor validation, final verifier authority,
+persistent state, replanning boundaries, and checkpoint, journal, recovery,
+and task-ownership behavior.
+
+## Project layout
+
+```text
+agent/
+  __main__.py          CLI demos
+  orchestrator.py      lifecycle coordination
+  planner.py           structured plan generation
+  executor.py          validated operations and journal integration
+  verifier.py          intermediate assessment and final verification
+  replanning.py        bounded replanning control
+  recovery.py          checkpoint and journal reconciliation
+  state/               persistent progress, checkpoints, and locks
+  tools/               repository and command adapters
+tests/
+  unit/                isolated component tests
+  integration/         lifecycle and repository-boundary tests
+```
+
+## Current scope
+
+AdaLongHorizon supports one local process and one local workspace per task.
+It does not implement distributed coordination, multi-agent recovery, or
+additional capabilities beyond the local single-agent model. A checkpoint
+records the agent's prior knowledge; recovery still rechecks relevant
+repository state before it resumes work.

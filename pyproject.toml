@@ -20,5 +20,5 @@ include = ["agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-p no:cacheprovider --basetemp=.pytest_tmp"
+addopts = "-p no:cacheprovider --basetemp=.pytest_tmp --import-mode=importlib"
 

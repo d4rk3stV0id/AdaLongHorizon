@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, replace
+from uuid import uuid4
 
 from .errors import BudgetExceeded, RepositoryError
 from .llm.base import LLMProvider, LLMResponse
@@ -76,9 +77,10 @@ class Action:
 # ---------------------------------------------------------------------------
 
 class Executor:
-    def __init__(self, repository: RepositoryAdapter, provider: LLMProvider):
+    def __init__(self, repository: RepositoryAdapter, provider: LLMProvider, journal=None):
         self.repository = repository
         self.provider = provider
+        self.journal = journal
 
     def eligible_step(self, state: TaskState) -> PlanStep | None:
         """Return the next step whose dependencies are all completed."""
@@ -230,9 +232,21 @@ class Executor:
                 before_content = self.repository.read_file(action.path or "")
             except RepositoryError:
                 pass
-            result = self.repository.edit_file(action.path or "", action.edits or [])
-        else:
-            result = self.repository.write_file(action.path or "", action.content or "")
+        action_id = uuid4().hex
+        if self.journal is not None:
+            # Must succeed before the mutation is permitted.
+            self.journal.intent(action_id, state, step, asdict(action), before_content)
+        try:
+            if action.type == "edit_file":
+                result = self.repository.edit_file(action.path or "", action.edits or [])
+            else:
+                result = self.repository.write_file(action.path or "", action.content or "")
+        except Exception as exc:
+            if self.journal is not None:
+                self.journal.outcome(action_id, state, "ambiguous", None, step_id=step.step_id)
+            raise
+        if self.journal is not None:
+            self.journal.outcome(action_id, state, "succeeded" if result.success else "failed", result, step_id=step.step_id)
         observations.results.append(result)
         observations.execution_records.append(ExecutionRecord(
             step_id=step.step_id,

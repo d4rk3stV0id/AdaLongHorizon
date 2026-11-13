@@ -25,7 +25,7 @@ class ReplanDecisionKind(StrEnum):
 class ReplanningController:
     """Owns policy only; it cannot update persistent requirement state."""
 
-    def __init__(self, config: AgentConfig, verifier: Verifier):
+    def __init__(self, config: AgentConfig, verifier: Verifier, state: TaskState | None = None):
         self.config = config
         self.verifier = verifier
         self.outcomes: list[ExecutionOutcome] = []
@@ -33,6 +33,49 @@ class ReplanningController:
         self._replans = 0
         self._retries: dict[str, int] = {}
         self._seen: set[str] = set()
+        if state is not None:
+            self._restore_from_state(state)
+
+    def _restore_from_state(self, state: TaskState) -> None:
+        """Restore M4 replanning history and prior outcomes from durable task state."""
+        raw_history = state.transient.get("replan_history", [])
+        for item in raw_history:
+            if isinstance(item, dict):
+                entry = ReplanHistoryEntry(
+                    from_plan_id=item["from_plan_id"],
+                    from_version=item["from_version"],
+                    outcome_signature=item.get("outcome_signature", ""),
+                    result=item.get("result", ""),
+                    reason=item.get("reason", ""),
+                    to_plan_id=item.get("to_plan_id"),
+                    to_version=item.get("to_version"),
+                )
+            elif isinstance(item, ReplanHistoryEntry):
+                entry = item
+            else:
+                continue
+            self.history.append(entry)
+            if entry.result == "activated":
+                self._replans += 1
+            if entry.result == "retried":
+                self._retries[entry.outcome_signature] = self._retries.get(entry.outcome_signature, 0) + 1
+
+        raw_outcomes = state.transient.get("execution_outcomes", [])
+        for item in raw_outcomes:
+            if isinstance(item, dict):
+                outcome = ExecutionOutcome(
+                    step_id=item.get("step_id"),
+                    kind=ExecutionOutcomeKind(item["kind"]) if "kind" in item else ExecutionOutcomeKind.PROGRESS,
+                    reason=InvalidationReason(item["reason"]) if item.get("reason") else None,
+                    signature=item.get("signature", ""),
+                    retryable=item.get("retryable", False),
+                    detail=item.get("detail", ""),
+                )
+            elif isinstance(item, ExecutionOutcome):
+                outcome = item
+            else:
+                continue
+            self.outcomes.append(outcome)
 
     def classify(self, record: ExecutionRecord | None, assessment: IntermediateAssessment | None = None,
                  error: Exception | None = None) -> ExecutionOutcome:
