@@ -392,6 +392,7 @@ def test_orchestrator_multiply_task_completed(git_repo: Path):
         cwd=git_repo,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 

@@ -17,10 +17,11 @@ from .errors import BudgetExceeded
 from .executor import Executor
 from .manager import BoundedExecutionContract, ControlDecisionKind, MEAManager
 from .replanning import ReplanDecisionKind, ReplanningController
+from .recovery import RecoveryJournal, checkpoint_runtime, reconcile_recovery, repository_identity
 from .llm.provider import DeterministicProvider
 from .models import (
-    AgentConfig, BudgetLedger, IssueSpec, Lifecycle, ObservationBundle,
-    RunEvent, StepStatus, TaskState,
+    AgentConfig, BudgetLedger, ExecutionRecord, IssueSpec, Lifecycle,
+    ObservationBundle, RunEvent, StepStatus, TaskState, ToolResult,
 )
 from .planner import Planner
 from .state.store import StateStore
@@ -61,9 +62,27 @@ class Orchestrator:
         round_id: int = 1,
         contract: BoundedExecutionContract | None = None,
     ) -> tuple[TaskState, ObservationBundle]:
+        task_id = uuid4().hex
+        with self.store.task_lock(task_id):
+            if persistent_state is None:
+                return self._run_with_ownership(
+                    issue, budget, persistent_state, requirement_checks, round_id, contract, task_id,
+                )
+            with self.store.task_lock(persistent_state.task_id):
+                return self._run_with_ownership(
+                    issue, budget, persistent_state, requirement_checks, round_id, contract, task_id,
+                )
+
+    def _run_with_ownership(
+        self, issue: IssueSpec, budget: BudgetLedger | None,
+        persistent_state: PersistentTaskState | None,
+        requirement_checks: dict[str, list[str]] | None, round_id: int,
+        contract: BoundedExecutionContract | None, task_id: str,
+    ) -> tuple[TaskState, ObservationBundle]:
         state = TaskState(
             issue,
             budget=budget or BudgetLedger(command_timeout_seconds=self.config.command_timeout_seconds),
+            task_id=task_id,
         )
         obs = ObservationBundle(state.task_id)
         self._save_event(state, "task_created")
@@ -83,15 +102,68 @@ class Orchestrator:
             )
             if contract is not None:
                 state.plan.requirement_ids = list(contract.requirement_ids)
+            recovery_id = repository_identity(snapshot.root, snapshot.baseline_commit)
+            journal = RecoveryJournal(self.store, state.task_id, recovery_id)
+            checkpoint_runtime(
+                self.store, state, recovery_id, state.transient["checkpoint"], journal.sequence,
+                persistent_state.task_id if persistent_state is not None else None,
+            )
             self._save_event(state, "plan_created", {
                 "steps": [s.step_id for s in state.plan.steps],
                 "llm_usage": state.transient.get("last_llm_usage"),
             })
 
+            return self._execute_and_verify(
+                state, snapshot, obs, recovery_id, journal,
+                persistent_state=persistent_state,
+                requirement_checks=requirement_checks,
+                round_id=round_id, contract=contract,
+            )
+        except Exception as exc:
+            state.transient["error"] = str(exc)
+            terminal = {Lifecycle.COMPLETED, Lifecycle.BLOCKED, Lifecycle.FAILED, Lifecycle.BUDGET_EXHAUSTED}
+            if state.status not in terminal:
+                state.transition(Lifecycle.FAILED)
+            obs.notes.append(f"{type(exc).__name__}: {exc}")
+            self._save_event(state, "task_finished", {
+                "status": state.status.value,
+                "error": state.transient.get("error"),
+                "llm_usage": state.transient.get("last_llm_usage"),
+                "verification_result": state.transient.get("verification_result"),
+            })
+            return state, obs
+
+    def _execute_and_verify(
+        self,
+        state: TaskState,
+        snapshot: RepositorySnapshot,
+        obs: ObservationBundle,
+        recovery_id: str,
+        journal: RecoveryJournal,
+        persistent_state: PersistentTaskState | None = None,
+        requirement_checks: dict[str, list[str]] | None = None,
+        round_id: int = 1,
+        contract: BoundedExecutionContract | None = None,
+    ) -> tuple[TaskState, ObservationBundle]:
+        try:
+            # Seed obs.execution_records from recovered records if any
+            if state.transient.get("recovered_execution_records") and not obs.execution_records:
+                for rec_dict in state.transient["recovered_execution_records"]:
+                    tool_res = ToolResult(**rec_dict["tool_result"]) if isinstance(rec_dict.get("tool_result"), dict) else rec_dict.get("tool_result")
+                    obs.execution_records.append(ExecutionRecord(
+                        step_id=rec_dict["step_id"],
+                        expected_files=rec_dict["expected_files"],
+                        action=rec_dict["action"],
+                        before_content=rec_dict.get("before_content"),
+                        tool_result=tool_res,
+                        active=rec_dict.get("active", True),
+                    ))
+
             # --- EXECUTING ---
-            state.transition(Lifecycle.EXECUTING)
-            executor = Executor(self.repository, self.provider)
-            replanning = ReplanningController(self.config, self.verifier)
+            if state.status != Lifecycle.EXECUTING:
+                state.transition(Lifecycle.EXECUTING)
+            executor = Executor(self.repository, self.provider, journal=journal)
+            replanning = ReplanningController(self.config, self.verifier, state=state)
             while executor.eligible_step(state):
                 before_records = len(obs.execution_records)
                 try:
@@ -111,6 +183,10 @@ class Orchestrator:
                     "signature": outcome.signature, "detail": outcome.detail,
                     "assessment": assessment.status.value if assessment else None,
                 })
+                checkpoint_runtime(
+                    self.store, state, recovery_id, self.repository.checkpoint(), journal.sequence,
+                    persistent_state.task_id if persistent_state is not None else None,
+                )
                 if decision == ReplanDecisionKind.CONTINUE and executed:
                     self._save_event(state, "step_executed", {
                         "step": state.transient.get("last_step"),
@@ -129,7 +205,7 @@ class Orchestrator:
                     replan_snapshot = self.repository.inspect()
                     try:
                         candidate = self.planner.create_revised_plan(
-                            issue, replan_snapshot, state, state.budget,
+                            state.issue, replan_snapshot, state, state.budget,
                             replanning.context(state, contract, replan_snapshot),
                         )
                         errors = replanning.validate_candidate(candidate, state, contract, replan_snapshot)
@@ -140,9 +216,15 @@ class Orchestrator:
                         if record is not None:
                             record.active = False
                         state.plan = candidate
+                        state.transient["replan_history"] = [asdict(item) for item in replanning.history]
+                        checkpoint_runtime(
+                            self.store, state, recovery_id, self.repository.checkpoint(), journal.sequence,
+                            persistent_state.task_id if persistent_state is not None else None,
+                        )
                         self._save_event(state, "plan_revised", {"version": candidate.version, "reason": candidate.revision_reason})
                         continue
                     replanning.reject(old_plan, outcome, "; ".join(errors))
+                    state.transient["replan_history"] = [asdict(item) for item in replanning.history]
                 if error is not None:
                     state.transient["error"] = f"{type(error).__name__}: {error}"
                 obs.notes.append(f"Execution stopped: {outcome.kind.value}: {outcome.detail}")
@@ -158,6 +240,10 @@ class Orchestrator:
             verification = self.verifier.verify(self.repository, obs.execution_records, test_result)
             obs.audit_result = verification
             state.transient["verification_result"] = verification.to_dict()
+            checkpoint_runtime(
+                self.store, state, recovery_id, self.repository.checkpoint(), journal.sequence,
+                persistent_state.task_id if persistent_state is not None else None,
+            )
             obs.notes.append(f"Independent verification: {verification.status.value}.")
             if verification.failures:
                 obs.notes.extend(verification.failures)
@@ -203,6 +289,42 @@ class Orchestrator:
         })
         return state, obs
 
+    def recover(self, task_id: str) -> TaskState:
+        """Load/reconcile a runtime checkpoint; callers must resume normal verification afterward."""
+        with self.store.task_lock(task_id):
+            return self._recover_with_ownership(task_id)
+
+    def _recover_with_ownership(self, task_id: str) -> TaskState:
+        snapshot = self.repository.inspect()
+        state = reconcile_recovery(
+            self.store, self.verifier, self.repository, task_id,
+            repository_identity(snapshot.root, snapshot.baseline_commit),
+        )
+        self._save_event(state, "recovery_reconciled", state.transient.get("recovery", {}))
+        return state
+
+    def resume(
+        self,
+        task_id: str,
+        persistent_state: PersistentTaskState | None = None,
+        requirement_checks: dict[str, list[str]] | None = None,
+        round_id: int = 1,
+        contract: BoundedExecutionContract | None = None,
+    ) -> tuple[TaskState, ObservationBundle]:
+        """Resume execution of an interrupted task after recovering its checkpoint and journal."""
+        with self.store.task_lock(task_id):
+            state = self.recover(task_id)
+            snapshot = self.repository.inspect()
+            recovery_id = repository_identity(snapshot.root, snapshot.baseline_commit)
+            journal = RecoveryJournal(self.store, state.task_id, recovery_id)
+            obs = ObservationBundle(state.task_id)
+            return self._execute_and_verify(
+                state, snapshot, obs, recovery_id, journal,
+                persistent_state=persistent_state,
+                requirement_checks=requirement_checks,
+                round_id=round_id, contract=contract,
+            )
+
     def run_persistent_round(
         self,
         persistent_state: PersistentTaskState,
@@ -225,13 +347,24 @@ class Orchestrator:
         self, issue: IssueSpec, budget: BudgetLedger | None = None,
     ) -> tuple[PersistentTaskState, list[tuple[TaskState, ObservationBundle]]]:
         """Create durable progress, then run the explicit bounded M3 MEA loop."""
+        task_id = uuid4().hex
+        with self.store.task_lock(task_id):
+            return self._run_persistent_with_ownership(issue, budget, task_id)
+
+    def _run_persistent_with_ownership(
+        self, issue: IssueSpec, budget: BudgetLedger | None, task_id: str,
+    ) -> tuple[PersistentTaskState, list[tuple[TaskState, ObservationBundle]]]:
         run_started = perf_counter()
         self.last_run_trace = None
         shared_budget = budget or BudgetLedger(command_timeout_seconds=self.config.command_timeout_seconds)
-        task_id = uuid4().hex
         run_id = uuid4().hex
         progress = create_progress_state(task_id, issue)
         self.store.save_progress(progress)
+        # Hold the durable task ownership across every M3 runtime round.
+        with self.store.task_lock(task_id):
+            return self._run_persistent_rounds(issue, shared_budget, progress, task_id, run_started, run_id)
+
+    def _run_persistent_rounds(self, issue, shared_budget, progress, task_id, run_started, run_id):
         rounds: list[tuple[TaskState, ObservationBundle]] = []
         while True:
             decision = self.manager.decide(
